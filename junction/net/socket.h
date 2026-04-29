@@ -230,8 +230,22 @@ class IPSocket : public Socket {
 
   Status<size_t> GetIPSocketOptions(int optname,
                                     std::span<std::byte> value) const override;
+
+ private:
+  friend class cereal::access;
+
+  template <class Archive>
+  void save(Archive &ar) const {
+    ar(cereal::base_class<Socket>(this));
+  }
+
+  template <class Archive>
+  void load(Archive &ar) {
+    ar(cereal::base_class<Socket>(this));
+  }
 };
 
 }  // namespace junction
 
 CEREAL_REGISTER_TYPE(junction::Socket);
+CEREAL_REGISTER_POLYMORPHIC_RELATION(junction::Socket, junction::IPSocket);
