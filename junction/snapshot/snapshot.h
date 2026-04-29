@@ -45,10 +45,16 @@ struct StartupTimings {
   std::optional<Time> junction_main_start;
   std::optional<Time> restore_start;
   std::optional<Time> exec_start;
+  std::optional<Time> restore_fs_start;
+  std::optional<Time> restore_fs_end;
   std::optional<Time> restore_metadata_start;
+  std::optional<Time> restore_metadata_end;
   std::optional<Time> restore_data_start;
+  std::optional<Time> restore_data_end;
   std::optional<Time> first_function_start;
   std::optional<Time> first_function_end;
+  std::optional<Time> cold_uarch_start;
+  std::optional<Time> cold_uarch_end;
 
   Duration CaladanStartTime() {
     assert(junction_main_start);
@@ -71,23 +77,28 @@ struct StartupTimings {
   }
 
   Duration FSRestoreTime() {
-    assert(restore_metadata_start && restore_start);
-    return *restore_metadata_start - *restore_start;
+    assert(restore_fs_end && restore_fs_start);
+    return *restore_fs_end - *restore_fs_start;
   }
 
   Duration MetadataRestoreTime() {
-    assert(restore_data_start && restore_metadata_start);
-    return *restore_data_start - *restore_metadata_start;
+    assert(restore_metadata_end && restore_metadata_start);
+    return *restore_metadata_end - *restore_metadata_start;
   }
 
   Duration DataRestoreTime() {
-    assert(first_function_start && restore_data_start);
-    return *first_function_start - *restore_data_start;
+    assert(restore_data_end && restore_data_start);
+    return *restore_data_end - *restore_data_start;
   }
 
   Duration FirstIterTime() {
     assert(first_function_end && first_function_start);
     return *first_function_end - *first_function_start;
+  }
+
+  Duration ColdUarchTime() {
+    assert(cold_uarch_end && cold_uarch_start);
+    return *cold_uarch_end - *cold_uarch_start;
   }
 
   Duration TotalRestoreTime() {

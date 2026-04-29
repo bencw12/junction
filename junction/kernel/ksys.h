@@ -166,6 +166,12 @@ class KernelFile : public VectoredWriter {
     return KernelFile(ret);
   }
 
+  Status<long> Ioctl(unsigned long request, void *args) {
+      int ret = syscall_ioctl(fd_, request, args);
+      if (ret < 0) return MakeError(-ret);
+      return 0;
+  }
+
   KernelFile() noexcept = default;
   explicit KernelFile(int fd) noexcept : fd_(fd) {}
   ~KernelFile() {

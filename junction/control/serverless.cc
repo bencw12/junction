@@ -49,13 +49,38 @@ uint32_t getL3CacheSize() {
   return ways * physical_line_partitions * line_size * sets;
 }
 
+#define CACHE_FLUSH 5
+
 #pragma GCC push_options
 #pragma GCC optimize("O0")
 void ClearCaches() {
-  size_t size = 100 * getL3CacheSize();
-  std::unique_ptr<std::byte[]> buf =
-      std::make_unique_for_overwrite<std::byte[]>(size);
-  std::memset(buf.get(), 0xff, size);
+  size_t size = AlignUp(100 * getL3CacheSize(), kPageSize);
+
+  Status<void *> ret = KernelMMap(0, size, PROT_READ | PROT_WRITE,
+      MAP_PRIVATE | MAP_POPULATE | MAP_ANONYMOUS);
+
+  if (!ret) {
+    LOG(ERR) << "ClearCaches: mmap error";
+    return;
+  }
+
+  uint8_t *buf = reinterpret_cast<uint8_t *>(*ret);
+
+  // noop sled
+  std::memset(buf, 0x90, size);
+  buf[size - 1] = 0xc3;
+  Status<void> mprotect_ret = KernelMProtect(reinterpret_cast<void *>(buf),
+                                             size, PROT_READ | PROT_EXEC);
+  if (!mprotect_ret) {
+    LOG(ERR) << "ClearCaches: mprotect error";
+    return;
+  }
+  void (*noop_sled)() = reinterpret_cast<void (*)()>(buf);
+  noop_sled();
+  noop_sled();
+  noop_sled();
+
+  KernelMUnmap(*ret, size);
 }
 #pragma GCC pop_options
 
@@ -348,6 +373,7 @@ void PrintTimes(const std::vector<uint64_t> &times, std::string_view name) {
   }
 
   ss << ", \"first_iter\": " << timings().FirstIterTime().Microseconds();
+  ss << ", \"cold_uarch\": " << timings().ColdUarchTime().Microseconds();
   ss << "}";
   LOG(ERR) << ss.str();
 }
@@ -400,6 +426,13 @@ void RunRestored(std::shared_ptr<Process> proc, int chan_id,
     proc->JobControlStop();
     BUG_ON(!proc->WaitForFullStop());
     BUG_ON(!proc->get_mem_map().DumpTracerReport());
+  } else {
+      if (GetCfg().bench_cold_uarch_state())
+          for (int j = 0; j < CACHE_FLUSH; j++) ClearCaches();
+
+      timings().cold_uarch_start = Time::Now();
+      chan.DoRequest(std::string{arg});
+      timings().cold_uarch_end = Time::Now();
   }
   PrintTimes(chan.get_latencies(), GetCfg().GetArg("function_name"));
 
@@ -418,7 +451,7 @@ void WarmupAndSnapshot(std::shared_ptr<Process> proc, int chan_id,
 
   FunctionChannel &chan = fino->get_chan();
 
-  for (size_t i = 0; i < 10; i++) chan.DoRequest(std::string{arg});
+  for (size_t i = 0; i < 100; i++) chan.DoRequest(std::string{arg});
 
   chan.SnapshotPrepare();
   proc->JobControlStop();

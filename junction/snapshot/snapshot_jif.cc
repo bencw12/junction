@@ -277,6 +277,43 @@ Status<std::shared_ptr<Process>> RestoreProcessFromJIF(
   DLOG(INFO) << "jif: loading Junction kernel from " << metadata_path
              << " and JIF object file '" << jif_path << "'";
 
+  if (GetCfg().kernel_restoring()) {
+      timings().restore_data_start = Time::Now();
+    Status<KernelFile> jifpager_dev =
+        KernelFile::Open("/dev/jif_pager", 0, FileMode::kWrite);
+    if (unlikely(!jifpager_dev)) return MakeError(jifpager_dev);
+
+    struct jifpager_load_args args = {0};
+    args.path = reinterpret_cast<const char *>(jif_path.data());
+    args.len = jif_path.size();
+
+    auto ioctl = JIFPAGER_IOC_LOAD;
+
+    Status<long> ret =
+        (*jifpager_dev)
+            .Ioctl(ioctl, reinterpret_cast<void *>(&args));
+
+    auto restore_end = Time::Now();
+    auto restore_time = restore_end - *timings().restore_data_start;
+    LOG(INFO) << "Kernel JIF load took " << restore_time.Microseconds() << "us";
+
+    if (unlikely(!ret)) {
+        LOG(ERR) << "Kernel JIF load failed: " << ret.error();
+        return MakeError(ret);
+    };
+    timings().restore_data_end = Time::Now();
+  } else {
+    Status<KernelFile> jif_file = KernelFile::Open(jif_path, 0, FileMode::kRead);
+    if (!jif_file) return MakeError(jif_file);
+    Status<jif_data> ret = ::junction::LoadJIF(*jif_file);
+
+    if (unlikely(!ret)) {
+      LOG(ERR) << "Userspace JIF load failed: " << ret.error();
+      return MakeError(ret);
+    };
+  }
+
+  timings().restore_fs_start = Time::Now();
   Status<KernelFile> metadata_file =
       KernelFile::Open(metadata_path, 0, FileMode::kRead);
   if (!metadata_file) return MakeError(metadata_file);
@@ -287,36 +324,12 @@ Status<std::shared_ptr<Process>> RestoreProcessFromJIF(
   cereal::BinaryInputArchive ar(instream);
 
   if (Status<void> ret = FSRestore(ar); unlikely(!ret)) return MakeError(ret);
+  timings().restore_fs_end = Time::Now();
+
   timings().restore_metadata_start = Time::Now();
   ar(p);
   SerializeUnixSocketState(ar);
-  timings().restore_data_start = Time::Now();
-
-  Status<KernelFile> jif_file = KernelFile::Open(jif_path, 0, FileMode::kRead);
-  if (!jif_file) return MakeError(jif_file);
-
-  if (GetCfg().kernel_restoring()) {
-    Status<KernelFile> jifpager_dev =
-        KernelFile::Open("/dev/jif_pager", 0, FileMode::kWrite);
-    if (unlikely(!jifpager_dev)) return MakeError(jifpager_dev);
-
-    std::span<const std::byte> path_bytes = std::span<const std::byte>(
-        reinterpret_cast<std::byte const *>(jif_path.data()), jif_path.size());
-
-    Status<size_t> ret = (*jifpager_dev).Write(path_bytes);
-
-    if (unlikely(!ret)) {
-      LOG(ERR) << "Kernel JIF load failed: " << ret.error();
-      return MakeError(ret);
-    };
-  } else {
-    Status<jif_data> ret = ::junction::LoadJIF(*jif_file);
-
-    if (unlikely(!ret)) {
-      LOG(ERR) << "Userspace JIF load failed: " << ret.error();
-      return MakeError(ret);
-    };
-  }
+  timings().restore_metadata_end = Time::Now();
 
   if (unlikely(GetCfg().mem_trace())) p->get_mem_map().EnableTracing(*p.get());
 

@@ -142,22 +142,16 @@ long usys_connect(int sockfd, const struct sockaddr *addr_in,
   return 0;
 }
 
-long usys_setsockopt(int sockfd, int level, int option_name,
-                     const void *option_value, socklen_t option_len) {
+long usys_setsockopt(int sockfd, [[maybe_unused]] int level,
+                     [[maybe_unused]] int option_name,
+                     [[maybe_unused]] const void *option_value,
+                     [[maybe_unused]] socklen_t option_len) {
   auto sock_ret = FDToSocket(sockfd);
   if (unlikely(!sock_ret)) return MakeCError(sock_ret);
-  Socket &s = sock_ret.value().get();
   if (level == SOL_IPV6) {
     return -ENOPROTOOPT;
   }
-  Status<void> val = s.SetSockOpt(
-      level, option_name,
-      std::span<const std::byte>(
-          reinterpret_cast<const std::byte *>(option_value), option_len));
-  if (!val) {
-    LOG_ONCE(WARN) << "Unsupported: setsockopt";
-    return MakeCError(val);
-  }
+  LOG_ONCE(WARN) << "Unsupported: setsockopt";
   return 0;
 }
 

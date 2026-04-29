@@ -120,7 +120,9 @@ po::options_description GetOptions() {
        "argument provided to serverless function")  //
       ("function_name", po::value<std::string>()->default_value("func"),
        "name of function being run")                               //
-      ("keep_alive", po::bool_switch()->default_value(false), "")  //
+      ("keep_alive", po::bool_switch()->default_value(false), "") //
+      ("bench_cold_uarch_state", po::bool_switch()->default_value(false),
+          "try to flush CPU caches before invoking a serverless function") //
       ("cwd", po::value<std::string>()->default_value(""),
        "current working directory at start");  //
   return desc;
@@ -193,6 +195,7 @@ Status<void> JunctionCfg::FillFromArgs(int argc, char *argv[]) {
   restore_populate_ = vm["restore_populate"].as<bool>();
   mem_trace_ = vm["mem-trace"].as<bool>();
   terminate_after_snapshot_ = vm["snapshot_terminate"].as<bool>();
+  bench_cold_uarch_state_ = vm["bench_cold_uarch_state"].as<bool>();
 
   if (mem_trace_ && !stack_switching) {
     std::cerr << "Enabling stack switching for memory tracing" << std::endl;

@@ -2,6 +2,8 @@
 
 #pragma once
 
+#include <sys/ioctl.h>
+
 #include <optional>
 #include <string_view>
 
@@ -9,10 +11,18 @@
 #include "junction/fs/fs.h"
 #include "junction/kernel/mm.h"
 
+#define JIFPAGER_MAGIC 0xF1
+#define JIFPAGER_IOC_LOAD _IO(JIFPAGER_MAGIC, 1)
+
 namespace junction {
 
 constexpr size_t kJifMagicLen = 4;
 constexpr uint32_t kJifVersion = 4;
+
+struct jifpager_load_args {
+  const char *path;
+  size_t len;
+};
 
 // program header format
 struct jif_phdr {

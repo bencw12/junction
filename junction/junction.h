@@ -64,6 +64,9 @@ class alignas(kCacheLineSize) JunctionCfg {
   [[nodiscard]] bool snapshot_terminate() const {
     return terminate_after_snapshot_;
   }
+  [[nodiscard]] bool bench_cold_uarch_state() const {
+    return bench_cold_uarch_state_;
+  }
   [[nodiscard]] uint16_t port() const { return port_; }
 
   [[nodiscard]] bool using_chroot() const { return chroot_path.size() > 0; }
@@ -83,6 +86,7 @@ class alignas(kCacheLineSize) JunctionCfg {
   bool madv_remap;
   bool expecting_snapshot_;
   bool restore_populate_;
+  bool bench_cold_uarch_state_;
   bool zpoline_;
   uid_t gid_;
   uid_t uid_;
