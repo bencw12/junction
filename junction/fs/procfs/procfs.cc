@@ -37,6 +37,23 @@ std::string GetMemInfo() {
   return ss.str();
 }
 
+std::string GetCpuInfo() {
+    std::ostringstream ss;
+    unsigned int max_cores = rt::RuntimeMaxCores();
+
+    for (unsigned int i = 0; i < max_cores; i++) {
+        ss << "processor         : " << i << "\n";
+        ss << "vendor_id         : Junction\n";
+        ss << "cpu family        : 1\n";
+        ss << "physical id       : " << i << "\n";
+        ss << "siblings          : 0\n";
+        ss << "core id           : " << i << "\n";
+        ss << "cpu cores         : 1\n";
+        ss << "apicid            : " << i << "\n\n";
+    }
+    return ss.str();
+}
+
 // TODO(jfried): fill out this implementation.
 std::string GetStat() {
   rt::RuntimeLibcGuard g;
@@ -563,6 +580,7 @@ class ProcRootDir : public ProcFSDir {
     AddDentLockedNoCheck("meminfo", MakeInode(0444, GetMemInfo));
     AddDentLockedNoCheck("mounts", MakeInode(0444, GetMounts));
     AddDentLockedNoCheck("stat", MakeInode(0444, GetStat));
+    AddDentLockedNoCheck("cpuinfo", MakeInode(0444, GetCpuInfo));
     AddIDirLockedNoCheck<ProcFSNetDir>("net");
   }
 
@@ -620,6 +638,8 @@ class SysRootDir : public ProcFSDir {
     std::shared_ptr<Inode> cpuListIno = MakeInode(0444, GetCpus);
     dir->Link("online", cpuListIno);
     dir->Link("possible", std::move(cpuListIno));
+    cpuListIno = MakeInode(0444, GetCpus);
+    dir->Link("present", std::move(cpuListIno));
   }
 
  private:
