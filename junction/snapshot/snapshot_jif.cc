@@ -277,6 +277,26 @@ Status<std::shared_ptr<Process>> RestoreProcessFromJIF(
   DLOG(INFO) << "jif: loading Junction kernel from " << metadata_path
              << " and JIF object file '" << jif_path << "'";
 
+    Status<KernelFile> metadata_file =
+        KernelFile::Open(metadata_path, 0, FileMode::kRead);
+    if (!metadata_file) return MakeError(metadata_file);
+
+    Status<struct stat> meta_stat = (*metadata_file).StatAt();
+    if (!meta_stat) return MakeError(meta_stat);
+
+    // read metadata into memory first to avoid contention on mm operations during async jif restore
+    std::string meta_buf;
+    meta_buf.resize(meta_stat->st_size);
+    if (Status<void> ret = ReadFull(
+            *metadata_file,
+            std::as_writable_bytes(std::span<char>(meta_buf.data(),
+                                                meta_buf.size())));
+        !ret)
+    return MakeError(ret);
+
+    std::stringstream instream(std::move(meta_buf));
+     cereal::BinaryInputArchive ar(instream);
+
   if (GetCfg().kernel_restoring()) {
       timings().restore_data_start = Time::Now();
     Status<KernelFile> jifpager_dev =
@@ -313,16 +333,9 @@ Status<std::shared_ptr<Process>> RestoreProcessFromJIF(
     };
   }
 
+  // overlap cpu work of restoring fs/metadata with jif load
   timings().restore_fs_start = Time::Now();
-  Status<KernelFile> metadata_file =
-      KernelFile::Open(metadata_path, 0, FileMode::kRead);
-  if (!metadata_file) return MakeError(metadata_file);
-
   std::shared_ptr<Process> p;
-  StreamBufferReader<KernelFile> w(*metadata_file);
-  std::istream instream(&w);
-  cereal::BinaryInputArchive ar(instream);
-
   if (Status<void> ret = FSRestore(ar); unlikely(!ret)) return MakeError(ret);
   timings().restore_fs_end = Time::Now();
 

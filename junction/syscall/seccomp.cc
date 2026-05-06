@@ -68,6 +68,7 @@ static struct sock_filter junction_core[] = {
     ALLOW_JUNCTION_SYSCALL(preadv2),
     ALLOW_JUNCTION_SYSCALL(pread64),
     ALLOW_JUNCTION_SYSCALL(exit_group),
+    ALLOW_JUNCTION_SYSCALL(newfstatat),
 #ifdef FUNCTION_PROFILING
     ALLOW_JUNCTION_SYSCALL(perf_event_open),
 #endif
