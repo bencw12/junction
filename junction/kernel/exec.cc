@@ -345,6 +345,27 @@ long DoExecve(std::shared_ptr<DirectoryEntry> dent, const char *filename,
     // preemption occurs).
     myth.get_rseq().reset();
 
+    // exec replaces a process's mappings but leaves it in the same address
+    // space: the new image was just loaded into whichever address space this
+    // core is bound to, which is the caller's. Without this the new MemoryMap
+    // keeps the default handle (kRootAddressSpace), so the next time the
+    // thread is scheduled the core binds the *root* address space and
+    // jmp_thread_direct restores its context from memory that only exists in
+    // the caller's -- a fault at the moment of the switch, with no frame to
+    // report it from.
+    //
+    // Only shows up once the process is descheduled and resumed, so it needs
+    // a second runnable process and something to wake up for. `sleep 1 &` is
+    // enough. See docs/bug-exec-timer-address-space.md.
+    old_mm.TransferAddressSpaceTo(**mm);
+
+    // Dropping the old map unmaps the old image, and %fs still points into it:
+    // a guest syscall runs on the guest's TCB, so any LibOS code that touches
+    // thread-local storage between here and the jump into the new image would
+    // fault on freed memory. Put the LibOS fsbase back first; the new program's
+    // is installed when it starts.
+    SetFSBase(perthread_read(runtime_fsbase));
+
     // Complete the exec
     p.FinishExec(std::move(*mm));
 

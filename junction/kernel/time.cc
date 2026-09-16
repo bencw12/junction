@@ -8,6 +8,10 @@
 #include "junction/kernel/proc.h"
 #include "junction/kernel/usys.h"
 
+extern "C" {
+#include <sys/resource.h>
+}
+
 namespace junction {
 
 // Junction uses a microsecond-resolution unix time monotonic clock for all
@@ -36,6 +40,33 @@ long usys_times(struct tms *buf) {
   buf->tms_cutime = buf->tms_cstime = 0;
   buf->tms_utime = myproc().GetRuntime().Seconds() *
                    static_cast<double>(sysconf(_SC_CLK_TCK));
+  return 0;
+}
+
+long usys_getrusage(int who, struct rusage *usage) {
+  if (!usage) return -EFAULT;
+
+  memset(usage, 0, sizeof(*usage));
+
+  // Junction does not separate time spent in the guest from time spent in the
+  // LibOS on the guest's behalf, so all of it is reported as user time.
+  Duration d(0);
+  switch (who) {
+    case RUSAGE_SELF:
+      d = myproc().GetRuntime();
+      break;
+    case RUSAGE_THREAD:
+      d = mythread().GetRuntime();
+      break;
+    case RUSAGE_CHILDREN:
+      // Reaped children's time is not accumulated yet; report zero rather
+      // than something wrong.
+      break;
+    default:
+      return -EINVAL;
+  }
+
+  usage->ru_utime = d.Timeval();
   return 0;
 }
 

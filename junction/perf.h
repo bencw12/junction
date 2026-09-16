@@ -31,6 +31,8 @@ class PerfEventMon {
 
     mpage_ = reinterpret_cast<struct perf_event_mmap_page *>(
         ksys_mmap(NULL, kPageSize, PROT_READ, MAP_SHARED, fd_, 0));
+    TRACE_MEM(kJunctionInternal, "mmap-perf", nullptr, kPageSize, PROT_READ,
+              MAP_SHARED, fd_, 0, reinterpret_cast<intptr_t>(mpage_));
     if (mpage_ == MAP_FAILED) {
       ksys_close(fd_);
       throw std::runtime_error("failed to mmap perf event page");

@@ -18,6 +18,39 @@ extern "C" {
 
 namespace junction {
 
+// Records a memory operation when --trace_libos_mem is on. The enum lives here
+// rather than in memtrace.h because memtrace.cc needs ksys.h, and the mapping
+// wrappers below need the enum.
+enum class MemTraceSource : uint8_t {
+  kJunctionInternal,  // Junction's own code, deliberately
+  kJunctionLibc,      // Junction's glibc, trapped by seccomp
+  kCaladan,           // the runtime's allocators
+  kGuestSyscall,      // a guest's mmap/munmap, serviced by Junction
+};
+void MemTraceMap(MemTraceSource src, const char *op, uintptr_t addr, size_t len,
+                 int prot, int flags, int fd, int64_t off, uintptr_t caller,
+                 int64_t result);
+bool MemTraceEnabled();
+
+// Reports a structural change to memory that other address spaces have already
+// inherited. Unlike the trace, this is always on: it costs one relaxed atomic
+// load before the first clone, and the bug it catches is silent. See
+// CheckFrozenViolation() in memtrace.cc for what counts and why.
+void CheckFrozenViolation(const char *op, uintptr_t addr, size_t len);
+
+#define CHECK_FROZEN(op, addr, len) \
+  CheckFrozenViolation(op, reinterpret_cast<uintptr_t>(addr), len)
+
+#define TRACE_MEM(source, op, addr, len, prot, flags, fd, off, res)          \
+  do {                                                                       \
+    if (unlikely(MemTraceEnabled()))                                         \
+      MemTraceMap(MemTraceSource::source, op, reinterpret_cast<uintptr_t>(addr), \
+                  len, prot, flags, fd, off,                                 \
+                  reinterpret_cast<uintptr_t>(__builtin_return_address(0)),  \
+                  static_cast<int64_t>(res));                                \
+  } while (0)
+
+
 inline constexpr int kMaxIovLen = 1024;  // Linux's max.
 
 #ifdef WRITEABLE_LINUX_FS
@@ -215,6 +248,8 @@ class KernelFile : public VectoredWriter {
     assert(!(flags & (MAP_FIXED | MAP_ANONYMOUS)));
     flags |= MAP_PRIVATE;
     intptr_t ret = ksys_mmap(nullptr, length, prot, flags, fd_, off);
+    TRACE_MEM(kJunctionInternal, "mmap-file", 0UL, length, prot, flags, fd_,
+              off, ret);
     if (ret < 0) return MakeError(-ret);
     return reinterpret_cast<void *>(ret);
   }
@@ -224,6 +259,8 @@ class KernelFile : public VectoredWriter {
                          off_t off) {
     assert(!(flags & MAP_ANONYMOUS));
     flags |= MAP_FIXED | MAP_PRIVATE;
+    TRACE_MEM(kJunctionInternal, "mmap-file-fixed", addr, length, prot, flags,
+              fd_, off, 0);
     intptr_t ret = ksys_mmap(addr, length, prot, flags, fd_, off);
     if (ret < 0) return MakeError(-ret);
     assert(reinterpret_cast<void *>(ret) == addr);
@@ -305,11 +342,15 @@ class KernelFile : public VectoredWriter {
   off_t off_{0};
 };
 
-// Map anonymous memory.
+// Map anonymous memory. MAP_PRIVATE is the default, but a caller that asked
+// for MAP_SHARED keeps it: setting both bits does not mean "either one", it
+// spells MAP_SHARED_VALIDATE, and the kernel rejects it here.
 inline Status<void *> KernelMMap(void *addr, size_t length, int prot,
                                  int flags) {
-  flags |= MAP_ANONYMOUS | MAP_PRIVATE;
+  flags |= MAP_ANONYMOUS;
+  if (!(flags & MAP_SHARED)) flags |= MAP_PRIVATE;
   intptr_t ret = ksys_mmap(addr, length, prot, flags, -1, 0);
+  TRACE_MEM(kJunctionInternal, "mmap", addr, length, prot, flags, -1, 0, ret);
   if (ret < 0) return MakeError(-ret);
   return reinterpret_cast<void *>(ret);
 }
@@ -317,8 +358,10 @@ inline Status<void *> KernelMMap(void *addr, size_t length, int prot,
 // Map anonymous memory to a fixed address.
 inline Status<void> KernelMMapFixed(void *addr, size_t length, int prot,
                                     int flags) {
-  flags |= MAP_ANONYMOUS | MAP_FIXED | MAP_PRIVATE;
+  flags |= MAP_ANONYMOUS | MAP_FIXED;
+  if (!(flags & MAP_SHARED)) flags |= MAP_PRIVATE;
   intptr_t ret = ksys_mmap(addr, length, prot, flags, -1, 0);
+  TRACE_MEM(kJunctionInternal, "mmap", addr, length, prot, flags, -1, 0, ret);
   if (ret < 0) return MakeError(-ret);
   assert(reinterpret_cast<void *>(ret) == addr);
   return {};
@@ -327,21 +370,31 @@ inline Status<void> KernelMMapFixed(void *addr, size_t length, int prot,
 // Unmap memory.
 inline Status<void> KernelMUnmap(void *addr, size_t length) {
   int ret = ksys_munmap(addr, length);
+  TRACE_MEM(kJunctionInternal, "munmap", addr, length, 0, 0, -1, 0, ret);
   if (ret < 0) return MakeError(-ret);
+  CHECK_FROZEN("munmap", addr, length);
   return {};
 }
 
 // Change memory permissions.
 inline Status<void> KernelMProtect(void *addr, size_t length, int prot) {
   int ret = ksys_mprotect(addr, length, prot);
+  TRACE_MEM(kJunctionInternal, "mprotect", addr, length, prot, 0, -1, 0, ret);
   if (ret < 0) return MakeError(-ret);
+  CHECK_FROZEN("mprotect", addr, length);
   return {};
 }
 
 // Pass mapping hints.
 inline Status<void> KernelMAdvise(void *addr, size_t length, int hint) {
   int ret = ksys_madvise(addr, length, hint);
+  TRACE_MEM(kJunctionInternal, "madvise", addr, length, 0, hint, -1, 0, ret);
   if (ret < 0) return MakeError(-ret);
+  // MADV_REMOVE is the one hint that propagates: it punches the shared object,
+  // so every address space mapping it sees the same result. MADV_DONTNEED only
+  // drops the caller's PTEs, and on private memory it discards the contents
+  // outright -- which is why it has to be translated, not inherited.
+  if (hint == MADV_DONTNEED) CHECK_FROZEN("madvise(DONTNEED)", addr, length);
   return {};
 }
 
@@ -349,7 +402,10 @@ inline Status<void *> KernelMRemap(void *old_addr, size_t old_sz,
                                    size_t new_len, int flags,
                                    void *new_addr = nullptr) {
   intptr_t ret = ksys_mremap(old_addr, old_sz, new_len, flags, new_addr);
+  TRACE_MEM(kJunctionInternal, "mremap", old_addr, old_sz, 0, flags, -1,
+            static_cast<int64_t>(new_len), ret);
   if (ret < 0) return MakeError(-ret);
+  CHECK_FROZEN("mremap", old_addr, old_sz);
   return reinterpret_cast<void *>(ret);
 }
 

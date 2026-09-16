@@ -67,6 +67,20 @@ class alignas(kCacheLineSize) FutexTable {
   }
 
   detail::futex_bucket buckets_[kBuckets];
+
+ public:
+  // Prints every blocked waiter: the key it is waiting on and the value
+  // currently at that key. A waiter whose key still holds the value it is
+  // waiting to change is the shape of a wake that can never succeed -- as
+  // opposed to a wake that never happened. Diagnostics only; see
+  // Process::DumpAllThreads().
+  template <typename Fn>
+  void ForEachWaiter(Fn fn) {
+    for (size_t i = 0; i < kBuckets; i++) {
+      rt::SpinGuard g(buckets_[i].lock);
+      for (auto &w : buckets_[i].futexes) fn(w.key, w.bitset);
+    }
+  }
 };
 
 }  // namespace junction

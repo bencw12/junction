@@ -15,8 +15,23 @@ namespace junction::memfs {
 inline constexpr __fsword_t TMPFS_MAGIC = 0x01021994;
 inline constexpr size_t kBlockSize = 4096;
 inline constexpr size_t kMaxSizeBytes = (1UL << 28);                  // 256 MB
-inline constexpr size_t kMaxMemfdExtent = (1UL << 45);                // 35 TB
-inline constexpr size_t kMaxFiles = kMaxMemfdExtent / kMaxSizeBytes;  // 128K
+// The extent region is reserved as a single contiguous hole at startup, so its
+// size is bounded by what is actually available rather than by what the memfd
+// could address. 32 TiB was the old value, and nothing could reserve it: the
+// kernel places the LibOS image and its heap around 87-89 TiB, leaving no
+// 32 TiB hole above kVirtualAreaMax on some runs and a region ending at
+// 127.5 TiB on others -- a coin flip at startup.
+//
+// 4 TiB is 16384 files of kMaxSizeBytes each. The previous limit of 128K was
+// nominal: addresses came from a monotonic counter that never recycled, so the
+// 6144th file creation ran off the end of the region it was allocating from,
+// long before the file count could matter.
+inline constexpr size_t kMaxMemfdExtent = (1UL << 42);                // 4 TiB
+inline constexpr size_t kMaxFiles = kMaxMemfdExtent / kMaxSizeBytes;  // 16384
+
+// Extents live in one contiguous region, reserved at startup, whose base is
+// chosen then rather than at compile time -- see the comment on memfs_base in
+// memfs.cc for the layout and for why the base cannot be a constant.
 
 inline void StatFs(struct statfs *buf) {
   buf->f_type = TMPFS_MAGIC;

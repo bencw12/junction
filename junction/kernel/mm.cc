@@ -20,6 +20,8 @@ extern "C" {
 #include "junction/base/finally.h"
 #include "junction/bindings/log.h"
 #include "junction/fs/file.h"
+#include "junction/kernel/as.h"
+#include "junction/kernel/memtrace.h"
 #include "junction/kernel/mm.h"
 #include "junction/kernel/proc.h"
 #include "junction/kernel/usys.h"
@@ -28,6 +30,14 @@ namespace junction {
 
 // Lock protecting allocation of memory maps.
 rt::Spin MemoryMap::mm_lock_;
+
+// How many memory maps are using each reserved range. A forked child keeps its
+// parent's addresses -- that is the point of fork -- so the range stays
+// reserved until the last of them is gone, even though they occupy different
+// address spaces.
+namespace {
+std::map<uintptr_t, unsigned int> mm_region_refs;
+}  // namespace
 // Set of intervals of allocated memory areas across mem maps. Includes a
 // reservation for each memory map as well as memory areas allocated outside of
 // these regions.
@@ -107,6 +117,23 @@ std::string VMArea::TypeString() const {
   }
 }
 
+bool MemoryMap::CheckAccess(const void *addr, size_t len, int prot) {
+  if (!addr || !len) return false;
+  uintptr_t pos = reinterpret_cast<uintptr_t>(addr);
+  uintptr_t end = pos + len;
+  if (end < pos) return false;  // wrapped
+
+  rt::ScopedSharedLock g(mu_);
+  while (pos < end) {
+    Status<std::reference_wrapper<VMArea>> vma = Find(pos);
+    if (!vma) return false;
+    const VMArea &v = *vma;
+    if ((v.prot & prot) != prot) return false;
+    pos = v.end;
+  }
+  return true;
+}
+
 bool MemoryMap::ContainedInMapBounds(void *addr, size_t len) const {
   auto [start, end] = AddressToBounds(addr, len);
   return start >= mm_start_ && end <= mm_end_;
@@ -124,15 +151,72 @@ void __noinline MMPanic(ExclusiveIntervalSet<VMArea> *vmareas,
   syscall_exit(-1);
 }
 
+void MemoryMap::AcquireRegionRef(uintptr_t start) {
+  assert(mm_lock_.IsHeld());
+  mm_region_refs[start]++;
+}
+
+bool MemoryMap::DropRegionRef(uintptr_t start) {
+  assert(mm_lock_.IsHeld());
+  auto it = mm_region_refs.find(start);
+  if (it == mm_region_refs.end()) return true;
+  if (--it->second > 0) return false;
+  mm_region_refs.erase(it);
+  return true;
+}
+
+std::vector<AddressRange> MemoryMap::GetReservedRegions() {
+  std::vector<AddressRange> out;
+  rt::SpinGuard g(mm_lock_);
+  for (auto const &[end, iv] : mem_areas_)
+    out.emplace_back(AddressRange{iv.get_start(), iv.get_end()});
+  return out;
+}
+
+std::shared_ptr<MemoryMap> MemoryMap::Fork(MemoryMap &parent,
+                                           uint64_t as_handle) {
+  rt::ScopedSharedLock lock(parent.mu_);
+  auto mm = std::make_shared<MemoryMap>(
+      reinterpret_cast<void *>(parent.mm_start_),
+      parent.mm_end_ - parent.mm_start_);
+  mm->as_handle_ = as_handle;
+  mm->owns_as_ = true;
+  mm->shares_reservation_ = true;
+  mm->brk_addr_ = parent.brk_addr_;
+  mm->binary_path_ = parent.binary_path_;
+  mm->cmd_line_ = parent.cmd_line_;
+  mm->is_non_reloc_ = parent.is_non_reloc_;
+  if (mm->is_non_reloc_) nr_non_reloc_maps_++;
+  // The child's mappings are the parent's, at the same addresses, in an
+  // address space Linux populated with copy-on-write copies of them.
+  for (auto const &[end, vma] : parent.vmareas_) {
+    VMArea copy = vma;
+    mm->vmareas_.Insert(std::move(copy));
+  }
+  {
+    rt::SpinGuard g(mm_lock_);
+    AcquireRegionRef(parent.mm_start_);
+  }
+  return mm;
+}
+
 Status<std::shared_ptr<MemoryMap>> MemoryMap::Create(size_t len) {
   Status<uintptr_t> base = AllocateMMRegion(len);
   if (!base) return MakeError(base);
   Status<void *> ret = KernelMMap(reinterpret_cast<void *>(*base), len,
                                   PROT_NONE, MAP_FIXED_NOREPLACE);
   if (unlikely(!ret || *ret != reinterpret_cast<void *>(*base))) {
+    LOG(ERR) << "mm: Create wanted 0x" << std::hex << *base << "-0x"
+             << (*base + len) << " got "
+             << (ret ? reinterpret_cast<uintptr_t>(*ret) : 0) << std::dec
+             << " in as=" << GetActiveAddressSpace();
     if (*ret != reinterpret_cast<void *>(*base)) MMPanic(nullptr, mem_areas_);
     MemoryMap::FreeMMRegion(*base, *base + len);
     return MakeError(ret);
+  }
+  {
+    rt::SpinGuard g(mm_lock_);
+    AcquireRegionRef(*base);
   }
   return std::make_shared<MemoryMap>(*ret, len);
 }
@@ -163,6 +247,42 @@ void MemoryMap::UnmapAll() {
 MemoryMap::~MemoryMap() {
   if (is_non_reloc_) nr_non_reloc_maps_--;
   if (is_fake_map_) return;
+
+  if (owns_as_) {
+    // The whole address space is going away, so there is nothing to unmap:
+    // Linux tears down every mapping when the last reference to the address
+    // space is dropped. Unmapping here would be wrong as well as wasteful,
+    // because these addresses are also in use by the process we forked from.
+    //
+    // Unless exec() handed the address space to a successor map, in which case
+    // the new image is already living in it and releasing it would pull the
+    // ground out from under the process.
+    if (!as_transferred_) {
+      // Do not leave this core bound to an address space that is going away.
+      // Whatever runs next on it -- in particular MemoryMap::Create, whose
+      // MAP_FIXED_NOREPLACE would land in the dead process's still-loaded mm
+      // and collide with its stale mappings -- must be looking at a live one.
+      if (GetActiveAddressSpace() == as_handle_)
+        ActivateAddressSpace(kRootAddressSpace);
+      ReleaseAddressSpace(as_handle_);
+    }
+    MemoryMap::FreeMMRegion(mm_start_, mm_end_);
+    return;
+  }
+
+  // Unmapping acts on whichever address space this core is bound to, so make
+  // sure that is the one these mappings actually live in.
+  //
+  // After exec() hands its address space to a successor, this map can outlive
+  // that successor: it is destroyed whenever its last reference drops, which
+  // may be long after the new image has exited and released the space. If it
+  // is already gone then so are these mappings -- Linux tore them down with
+  // it -- and only the reservation is left to release.
+  if (!TryActivateAddressSpace(as_handle_)) {
+    MemoryMap::FreeMMRegion(mm_start_, mm_end_);
+    return;
+  }
+
   for (auto const &[end, vma] : vmareas_) {
     if (ContainedInMapBounds(vma.Addr(), vma.Length())) continue;
     Status<void> ret = KernelMUnmap(vma.Addr(), vma.Length());
@@ -514,9 +634,10 @@ Status<uintptr_t> MemoryMap::SetBreak(uintptr_t brk_addr) {
 
 Status<void *> MemoryMap::MMap(void *addr, size_t len, int prot, int flags,
                                std::shared_ptr<File> f, off_t off) {
-  // the shared modes are currently unsupported
-  if ((flags & MAP_SHARED) != 0) {
-    LOG_ONCE(ERR) << "mm: shared mmap() mappings are unsupported";
+  // Shared anonymous mappings are real shared memory now that guests have
+  // separate address spaces. Shared file mappings still are not.
+  if ((flags & MAP_SHARED) != 0 && (flags & MAP_ANONYMOUS) == 0) {
+    LOG_ONCE(ERR) << "mm: shared file mmap() mappings are unsupported";
     // FIXME(amb): Java requires us to continue here to run
     // return MakeError(EINVAL);
   }
@@ -777,10 +898,13 @@ intptr_t usys_mmap(void *addr, size_t len, int prot, int flags, int fd,
                    off_t offset) {
   MemoryMap &mm = myproc().get_mem_map();
 
-  // Silently turn shmem requests into anonymous private memory.
+  // Shared anonymous memory used to be quietly downgraded to private: with
+  // every guest in one address space there was only ever one copy, so nothing
+  // could tell the difference. Once a process can fork, the difference is
+  // exactly what MAP_SHARED is for, so honour it.
   if ((flags & MAP_SHARED) && fd == -1) {
-    flags &= ~MAP_SHARED;
     flags |= MAP_ANONYMOUS;
+    if (!MultiAddressSpaceEnabled()) flags &= ~MAP_SHARED;
   } else if ((flags & MAP_SHARED_VALIDATE) == MAP_SHARED_VALIDATE) {
     // MAP_SHARED_VALIDATE happens to be (MAP_ANONYMOUS | MAP_SHARED). Remove
     // the anonymous flag so we hit the correct case below. Note that if fd is
@@ -792,6 +916,11 @@ intptr_t usys_mmap(void *addr, size_t len, int prot, int flags, int fd,
   if ((flags & MAP_ANONYMOUS) != 0) {
     Status<void *> ret = TracerGuardCheck(
         mm, [&] { return mm.MMapAnonymous(addr, len, prot, flags); });
+    if (unlikely(MemTraceEnabled()))
+      MemTraceMap(MemTraceSource::kGuestSyscall, "mmap",
+                  reinterpret_cast<uintptr_t>(addr), len, prot, flags, fd,
+                  offset, 0,
+                  ret ? reinterpret_cast<int64_t>(*ret) : -1);
     if (!ret) return MakeCErrorRestartSys(ret);
     return reinterpret_cast<intptr_t>(*ret);
   }

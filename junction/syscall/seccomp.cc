@@ -18,6 +18,9 @@ extern "C" {
 #include "junction/bindings/log.h"
 #include "junction/junction.h"
 #include "junction/kernel/ksys.h"
+#include "junction/kernel/memtrace.h"
+#include "junction/kernel/mm.h"
+#include "junction/kernel/as.h"
 #include "junction/kernel/proc.h"
 #include "junction/kernel/sigframe.h"
 #include "junction/kernel/trapframe.h"
@@ -52,6 +55,15 @@ static struct sock_filter allow_all_junction[] = {ALLOW_ANY_JUNCTION_SYSCALL};
 // Filter to enable tgkill().
 static struct sock_filter linux_tgkill[] = {ALLOW_JUNCTION_SYSCALL(tgkill)};
 
+// Syscalls used to create, switch between, and tear down address spaces.
+// clone() materializes a new address space, pause() is all the resulting clone
+// ever executes, and ioctl() drives /dev/junction_as.
+static struct sock_filter address_spaces[] = {
+    ALLOW_JUNCTION_SYSCALL(ioctl),  ALLOW_JUNCTION_SYSCALL(clone),
+    ALLOW_JUNCTION_SYSCALL(pause),  ALLOW_JUNCTION_SYSCALL(kill),
+    ALLOW_JUNCTION_SYSCALL(wait4),  ALLOW_JUNCTION_SYSCALL(rt_sigprocmask),
+};
+
 static struct sock_filter rtsigreturn[] = {ALLOW_CALADAN_SYSCALL(rt_sigreturn)};
 
 // Final filter that forwards all other system calls to our signal handler.
@@ -77,7 +89,7 @@ constexpr size_t filterMax =
     sizeof(caladan_filter) + sizeof(writeable_linux_fs) +
     sizeof(uncached_linux_fs) + sizeof(allow_all_junction) +
     sizeof(linux_tgkill) + sizeof(trap) + sizeof(junction_core) +
-    sizeof(rtsigreturn);
+    sizeof(rtsigreturn) + sizeof(address_spaces);
 
 /* Source: https://outflux.net/teach-seccomp/step-3/example.c
  */
@@ -102,6 +114,10 @@ Status<void> _install_seccomp_filter() {
 
   // Add Junction core filters.
   addFilter(junction_core, sizeof(junction_core));
+
+  // Allow the address-space operations fork() depends on.
+  if (MultiAddressSpaceEnabled())
+    addFilter(address_spaces, sizeof(address_spaces));
 
 #ifdef WRITEABLE_LINUX_FS
   // Allow system calls to modify host fs.
@@ -162,6 +178,33 @@ void log_syscall_msg(const char *msg_needed, long sysn) {
   ksys_write(STDOUT_FILENO, buf, pos - buf);
 }
 
+namespace {
+
+// Records a memory-mapping syscall that seccomp trapped out of Junction's own
+// libc. Everything else is left alone; the point is the memory operations.
+void TraceTrappedMemSyscall(k_ucontext *ctx, long sysn, long res) {
+  const char *op = nullptr;
+  switch (sysn) {
+    case __NR_mmap: op = "mmap"; break;
+    case __NR_munmap: op = "munmap"; break;
+    case __NR_mprotect: op = "mprotect"; break;
+    case __NR_madvise: op = "madvise"; break;
+    case __NR_mremap: op = "mremap"; break;
+    case __NR_brk: op = "brk"; break;
+    default: return;
+  }
+  MemTraceMap(MemTraceSource::kJunctionLibc, op,
+              static_cast<uintptr_t>(ctx->uc_mcontext.rdi),
+              static_cast<size_t>(ctx->uc_mcontext.rsi),
+              static_cast<int>(ctx->uc_mcontext.rdx),
+              static_cast<int>(ctx->uc_mcontext.r10),
+              static_cast<int>(static_cast<long>(ctx->uc_mcontext.r8)),
+              static_cast<int64_t>(ctx->uc_mcontext.r9),
+              static_cast<uintptr_t>(ctx->uc_mcontext.rip), res);
+}
+
+}  // namespace
+
 extern "C" void syscall_trap_handler(int nr, siginfo_t *info,
                                      void *void_context) {
   k_ucontext *ctx = reinterpret_cast<k_ucontext *>(void_context);
@@ -178,7 +221,23 @@ extern "C" void syscall_trap_handler(int nr, siginfo_t *info,
 
   long sysn = static_cast<long>(ctx->uc_mcontext.rax);
 
-  if (unlikely(!preempt_enabled())) {  // call probably from junction libc
+  // Is this Junction's own glibc, or a guest's?
+  //
+  // This used to test !preempt_enabled(), which is a heuristic and is wrong:
+  // LibOS code that runs with preemption enabled -- anything inside a guest
+  // syscall handler, for one -- had its glibc syscalls dispatched to the guest
+  // syscall table. The observable symptom was Junction's own brk arriving at
+  // usys_brk as "Unexpected syscall while in_kernel (brk)".
+  //
+  // The trapping rip is sound instead, because the two glibcs are separate
+  // images on opposite sides of the address-space partition: Junction's is
+  // linked into junction_run above kVirtualAreaMax, while a guest's comes from
+  // install/lib/libc.so.6 below it, and usys_mmap confines guests there.
+  //
+  // Not fsbase, which looks equally good and is not: usys_arch_prctl sets it
+  // without a range check, so a guest could point it above kVirtualAreaMax and
+  // have its own mappings served out of the shared LibOS arena.
+  if (unlikely(ctx->uc_mcontext.rip >= kVirtualAreaMax)) {
     // avoid infinitely looping when Junction's glibc makes a blocked syscall
 
     static bool once;
@@ -199,6 +258,7 @@ extern "C" void syscall_trap_handler(int nr, siginfo_t *info,
     // We don't allow the brk system call, set the return value to 0 so
     // Junction's libc uses mmap instead.
     if (sysn == __NR_brk) {
+      if (unlikely(MemTraceEnabled())) TraceTrappedMemSyscall(ctx, sysn, 0);
       ctx->uc_mcontext.rax = 0;
       return;
     }
@@ -210,6 +270,14 @@ extern "C" void syscall_trap_handler(int nr, siginfo_t *info,
     long arg4 = static_cast<long>(ctx->uc_mcontext.r8);
     long arg5 = static_cast<long>(ctx->uc_mcontext.r9);
     auto res = ksys_default(arg0, arg1, arg2, arg3, arg4, arg5, sysn);
+
+    // This is where Junction's own glibc ends up: its mmap is outside the
+    // ksys range, so seccomp traps it and it is executed natively here --
+    // landing in whichever address space this core is currently bound to.
+    // Worth seeing, because those mappings are the ones that do not
+    // propagate.
+    if (unlikely(MemTraceEnabled())) TraceTrappedMemSyscall(ctx, sysn, res);
+
     ctx->uc_mcontext.rax = static_cast<unsigned long>(res);
     return;
   }

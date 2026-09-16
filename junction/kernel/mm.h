@@ -9,6 +9,7 @@
 #include "junction/base/arch.h"
 #include "junction/base/error.h"
 #include "junction/base/interval_set.h"
+#include "junction/kernel/as.h"
 #include "junction/bindings/log.h"
 #include "junction/bindings/sync.h"
 #include "junction/fs/file.h"
@@ -157,6 +158,39 @@ class alignas(kCacheLineSize) MemoryMap {
         brk_addr_(mm_start_) {}
   ~MemoryMap();
 
+  // Creates the memory map of a forked child: the same mappings at the same
+  // addresses, but in an address space of its own. The caller supplies the
+  // address space, which this object takes ownership of.
+  static std::shared_ptr<MemoryMap> Fork(MemoryMap &parent,
+                                         uint64_t as_handle);
+
+  // The address space this memory map's mappings live in.
+  [[nodiscard]] uint64_t get_as_handle() const { return as_handle_; }
+
+  // Hands this memory map's address space to @other. Used by exec(), which
+  // replaces a process's mappings but keeps it in the same address space.
+  //
+  // Deliberately leaves owns_as_ alone and sets as_transferred_ instead. The
+  // only thing that must change is that *this* map stops releasing the address
+  // space -- the new image has already been loaded into it. Clearing owns_as_
+  // would additionally divert the destructor onto the unmap path, which tears
+  // down a reservation a forked map shares with its parent and desynchronises
+  // the global region map (MM Panic).
+  void TransferAddressSpaceTo(MemoryMap &other) {
+    other.as_handle_ = as_handle_;
+    other.owns_as_ = owns_as_;
+    as_transferred_ = true;
+    owns_as_ = false;
+  }
+
+  // The range reserved for this memory map.
+  [[nodiscard]] AddressRange get_reservation() const {
+    return {mm_start_, mm_end_};
+  }
+
+  // The ranges reserved for every guest memory map in the system.
+  static std::vector<AddressRange> GetReservedRegions();
+
   [[nodiscard]] std::vector<VMArea> get_vmas();
 
   // Run a function for each VMA. Runs with the memory map lock held (shared).
@@ -180,9 +214,12 @@ class alignas(kCacheLineSize) MemoryMap {
   Status<void *> MMap(void *addr, size_t len, int prot, int flags,
                       std::shared_ptr<File> f, off_t off);
 
-  // MMapAnonymous inserts an anonymous memory mapping.
+  // MMapAnonymous inserts an anonymous memory mapping. MAP_PRIVATE is the
+  // default, but a caller asking for MAP_SHARED gets shared memory: setting
+  // both bits would mean MAP_SHARED_VALIDATE to the kernel, not "either".
   Status<void *> MMapAnonymous(void *addr, size_t len, int prot, int flags) {
-    return MMap(addr, len, prot, flags | MAP_PRIVATE | MAP_ANONYMOUS, {}, 0);
+    if (!(flags & MAP_SHARED)) flags |= MAP_PRIVATE;
+    return MMap(addr, len, prot, flags | MAP_ANONYMOUS, {}, 0);
   }
 
   // MProtect changes the access protections of a range of mappings.
@@ -228,6 +265,12 @@ class alignas(kCacheLineSize) MemoryMap {
     return *tracer_.get();
   }
 
+  // CheckAccess reports whether [addr, addr + len) is mapped with at least
+  // @prot. Junction tracks its guests' mappings, so a bad pointer handed to a
+  // system call can be rejected with EFAULT the way Linux rejects it, instead
+  // of faulting inside the LibOS.
+  [[nodiscard]] bool CheckAccess(const void *addr, size_t len, int prot);
+
   // Returns true if this page fault is handled by the MM.
   bool HandlePageFault(uintptr_t addr, int required_prot, Time time);
 
@@ -256,6 +299,18 @@ class alignas(kCacheLineSize) MemoryMap {
       auto ptr = arg.data();
       cmd_line_.insert(cmd_line_.end(), ptr, ptr + arg.size() + 1);
     }
+  }
+
+  // True if @addr falls inside any process's reserved region, i.e. it is some
+  // guest's memory and belongs in one address space. Anything else is the
+  // LibOS's and must be visible in all of them. Uses a try-lock so it is safe
+  // to call from the mapping path itself; a contended check reports "guest"
+  // rather than risking a deadlock, which only ever loses a report.
+  static bool IsInSomeReservation(uintptr_t addr) {
+    if (!mm_lock_.TryLock()) return true;
+    bool found = mem_areas_.has_overlap(addr, addr + 1);
+    mm_lock_.Unlock();
+    return found;
   }
 
   static void RegisterMMRegion(uintptr_t base, size_t len) {
@@ -291,8 +346,13 @@ class alignas(kCacheLineSize) MemoryMap {
 
   static void FreeMMRegion(uintptr_t start, uintptr_t end) {
     rt::SpinGuard g(mm_lock_);
-    mem_areas_.Clear(start, end);
+    if (DropRegionRef(start)) mem_areas_.Clear(start, end);
   }
+
+  // Takes another reference to a reserved range (a fork keeps the addresses).
+  static void AcquireRegionRef(uintptr_t start);
+  // Drops a reference; returns true when the range may be released.
+  static bool DropRegionRef(uintptr_t start);
 
   static Status<uintptr_t> AllocateMMRegion(size_t len) {
     rt::SpinGuard g(mm_lock_);
@@ -332,6 +392,19 @@ class alignas(kCacheLineSize) MemoryMap {
   std::string cmd_line_;
   bool is_non_reloc_{false};
   bool is_fake_map_{false};  // old ELF snapshot code uses this.
+  // The address space these mappings live in. Guest processes that have never
+  // forked share the address space Junction started in.
+  uint64_t as_handle_{kRootAddressSpace};
+  // Whether destroying this memory map should release the address space. The
+  // root address space is never released, and exec() transfers ownership to
+  // the replacement memory map.
+  bool owns_as_{false};
+  // Set when exec() handed this map's address space to its successor.
+  bool as_transferred_{false};
+  // Whether this memory map shares its reserved range with a forked relative,
+  // in which case tearing it down must not unmap anything: the address space
+  // itself is going away, and the range still belongs to the other process.
+  bool shares_reservation_{false};
   static rt::Spin mm_lock_;
   static std::atomic_size_t nr_non_reloc_maps_;
   // Tracks all areas allocated in the virtual address space.

@@ -1,0 +1,661 @@
+# Implementing fork() correctly: the full plan
+
+`fork()` already works — 46/46 semantics checks matching native Linux. What is
+not yet correct is **LibOS memory mapped after an address space is cloned**,
+which is invisible to that address space. `docs/libos-memory-status.md` has the
+evidence; `docs/libos-memory-plan.md` has the argument. This is the build order.
+
+## The two constraints everything else follows from
+
+**1. rmap enumerates per VMA, and `vma->vm_mm` is single-valued.** So N address
+spaces need N VMAs over shared backing, not one shared VMA. That is what the
+memfd is *for*: it makes N separate VMAs legal (a common object to refer to) and
+free (the same physical pages). It does not avoid TLB shootdowns — it makes them
+visible to the kernel's existing machinery. Verified: `docs/traces/tlb_punch.c`.
+
+**2. `%gs` is Caladan's, `%fs` is the guest's.** Caladan's per-thread state is
+`%gs`-relative (`inc/base/thread.h`), which is why LibOS code runs correctly
+inside a guest syscall handler. glibc uses `%fs` — including `errno` — so any
+libc call from that context reads the *guest's* TCB and dies. Measured:
+`--debug_libos_alloc` segfaults in `__libc_malloc` on the arena lock.
+
+> **Therefore: every line of arena and fault-handler code must be glibc-free.**
+> Pool allocation, raw `ksyscall`, manual formatting. This is the same
+> discipline `ksys_*` and `memtrace.cc` already follow, and now there is a
+> stated reason for it.
+
+## The correctness invariant
+
+> An address range is never reused for a different `(fd, offset, prot)` binding
+> until it has been unmapped from every mm that materialised it.
+
+With it, every divergence between address spaces becomes an *absence*, absences
+fault, and the fault handler repairs them lazily. Nothing eager, nothing on the
+mm-switch path.
+
+---
+
+## Phase 0 — Guardrails
+
+Independent of everything else, cheap, and they make the rest safe to build.
+
+**0a. Fix the LibOS/guest discriminator.** `syscall_trap_handler` currently uses
+`if (unlikely(!preempt_enabled()))`, commented "probably from junction libc".
+It is wrong today: a LibOS syscall made with preemption enabled is dispatched to
+the *guest* syscall table, which is how `brk` ends up as
+`Unexpected syscall while in_kernel (brk)`.
+
+Replace with the trapping RIP:
+
+```c
+bool from_libos = ctx->uc_mcontext.rip >= kVirtualAreaMax;
+```
+
+Sound because the two glibcs are distinct images either side of the partition —
+Junction's at `0x7ffff78ad000`, the guest's at `0x4ffffddba000` from
+`install/lib/libc.so.6` — and `usys_mmap` confines guests below. Not `fsbase`:
+`usys_arch_prctl` does not range-check it, so a guest could set it above
+`kVirtualAreaMax` and have its own mappings served from the shared LibOS arena.
+
+*Verify:* `--debug_libos_alloc 128` no longer reports the `brk` misroute.
+
+**Status: done.** `seccomp.cc` now tests
+`ctx->uc_mcontext.rip >= kVirtualAreaMax`. The probe's `preempt_disable()`
+scaffold — which existed only to make the old heuristic classify correctly — was
+removed, so the LibOS `malloc` now runs with preemption *enabled*, the state
+every guest syscall handler is in:
+
+```
+debug: guest pid 2 ... preempt_enabled=1 (must work with preemption ENABLED)
+debug: LibOS malloc(128 MB) -> 0x7e9fcffdf010 [libos-range] in address space 4294967297
+```
+
+No `Unexpected syscall while in_kernel (brk)`. `scripts/fork_test.sh` still
+13/13 + 46/46 + 46/46. The mapping is still `ABSENT` from the other address
+space — that is the bug Phases 1-3 fix, not this one.
+
+**0b. Assert the frozen-after-init invariant.** The init-time shared regions
+(iokernel shm, SysV segments, hugetlbfs, directpath) are safe because nothing
+changes them structurally after the first guest exists. That holds today by
+accident. Add a check in `KernelMRemap` and `KernelMProtect` that the target is
+a guest range or that init has not finished. A comparison, and it turns a future
+silent bug into a loud one at the call site.
+
+**Status: done.** `CheckFrozenViolation()` in `memtrace.cc`, called from
+`KernelMUnmap`, `KernelMProtect`, `KernelMRemap` and `KernelMAdvise`. Always
+on, not behind `--trace_libos_mem`: one relaxed atomic load before the first
+clone, which is what the propagation-hazard check should have been and was not.
+
+Four operations, chosen rather than assumed. `munmap`, `mprotect` and `mremap`
+change a mapping other address spaces already have; `madvise(MADV_DONTNEED)` is
+included because on shared memory it silently means something else and on
+private memory it discards. `MADV_REMOVE` is deliberately *not* flagged: it
+punches the shared object, which propagates through `i_mmap`, and is what
+freeing is supposed to do.
+
+Measured before trusting it: zero reports across 39 ctest tests, 13+46+46
+fork_test checks, and the exec suite -- and it immediately caught memfs tearing
+down a 256 MB extent in one address space while a forked child held a live VMA
+over it. `scripts/guardrail_test.sh` tests both directions.
+
+**0c. Extend `AuditLibOSMemory()`** from "is anything private and writable" to
+"do all live address spaces agree on the LibOS range", by diffing
+`/proc/thread-self/maps` per address space. Debug-mode only. This is the net
+that catches whatever this plan failed to predict.
+
+Note `/proc/thread-self`, not `/proc/self` — the latter resolves to the thread
+group leader and reports the root mm regardless of which address space the
+calling kthread is bound to.
+
+**Status: done.** `AuditAddressSpaceCoherence()` in `as.cc`, behind
+`--debug_as_audit`, which runs it after every fork and at the fatal-fault path
+— where it turns `segfault ... addr=380000000000` into `address space
+4294967297 ... first absent from 4294967297: 0x380000000000`, naming the
+missing mapping instead of leaving it to be rediscovered.
+
+Three things it needed that were not obvious:
+
+- a registry of live address spaces. Nothing else in Junction keeps one: a
+  handle lives in the `MemoryMap` that owns it. It is in `.bss`, so the startup
+  sweep makes it shared — a private registry would give each address space its
+  own idea of which address spaces exist;
+- pre-allocated scratch. The audit reads `/proc/thread-self/maps` while bound
+  to *another* address space, so a buffer `mmap`'d at audit time would be
+  absent exactly where it is needed. The buffers are allocated once from
+  `InitAddressSpaces()`, before the first clone, and never freed — freeing them
+  would itself be a frozen violation;
+- `openat`/`pread64`/`close`, not `read`. `read` is not on the seccomp
+  allowlist, so a raw `read` from LibOS code traps to the SIGSYS handler and
+  returns `-ENOSYS`. It works before the filter is installed, which is why this
+  only broke once the audit started running after init. `msync` is blocked for
+  the same reason, which ruled out using it as a presence oracle.
+
+Comparison is by *coverage*, not exact range equality: the kernel splits and
+merges VMAs freely, so the same memory can be one line in one address space and
+three in another without anything being wrong. A gap is a difference; a seam is
+not.
+
+---
+
+## Phase 1 — Fault handler, proved out on memfs
+
+**Status: done.** `scripts/memfs_test.sh`, 13/13, each case checked against
+native Linux first. `docs/bug-memfs-extent-propagation.md` is the write-up.
+
+memfs was the one **demonstrated** failure (`docs/traces/memfs_race.c`: fork,
+parent creates a file, child reads it, segfault at `0x380000000000` in
+`MemInode::Read`) and the only one reachable without scale —
+`echo hi > /tmp/f; ( cat /tmp/f )` was enough. It was also the easiest consumer,
+because its extents are already `MAP_SHARED` from a memfd, so it could be made
+strictly 1:1 and served by a trivial handler. A real bug fixed, and the riskiest
+infrastructure built against the simplest case.
+
+**1a. Its own region, above `kVirtualAreaMax`.** Extents used to start at
+`0x380000000000`, inside the guest-addressable region — which is why the
+propagation hazard detector counted them as guest memory and reported nothing
+for five traced workloads.
+
+The region is **reserved at startup as one `PROT_NONE` mapping**, before the
+first clone. That does three things at once: proves it is free, stops anything
+else being placed inside it later, and makes it exist in every address space —
+so a fault in it is always a missing *extent*, never a missing region.
+
+A compile-time base was tried first and was wrong. The kernel puts the LibOS
+image and its heap wherever ASLR decides, observed at `0x575e1a723000` and
+`0x58b31b64a000`, both inside the fixed region that had been chosen. The base is
+now picked at runtime with `0x600000000000` preferred, and validated.
+
+The region also had to shrink, 32 TiB → 4 TiB (`kMaxFiles` 128K → 16384),
+because a contiguous 32 TiB hole above `kVirtualAreaMax` is not reliably
+available: some runs had none, others produced a region ending at 127.5 TiB. The
+old 128K was nominal — the address counter broke at 6144 file creations.
+
+**1b. One allocator instead of two.** The slot bitmap is now the only allocator
+and the address is derived from it, so `offset == addr - MemFsBase()`. There
+used to be a second, `next_memfs_faddr`, a monotonic address counter that never
+recycled: over 40 create/delete cycles of one file, 1 offset and 40 addresses. A
+fault carried no information about what belonged at the address, which is
+precisely why it could not be repaired.
+
+**1c. The fault handler.** `junction/kernel/arena.h` — a registry of managed
+slots, and `RepairManagedFault()`, which maps the enclosing granule at the
+matching offset and lets the instruction retry. Built with a lookup from the
+start even though memfs is one entry, so Phase 2 adds entries rather than
+rewriting the handler. It runs in signal context: `ksys_mmap` only, no libc, no
+locks, no allocation, and idempotent so two cores repairing the same granule
+race harmlessly.
+
+**What changed from the plan as written.** Two things, both discovered by
+building it:
+
+- **Freeing an extent must not unmap it.** The plan assumed deletion would
+  unmap and quarantine. It should not: other address spaces materialise extents
+  on demand and keep theirs regardless, so unmapping desynchronises only the
+  address space doing it — and punches a hole in the reserved region that the
+  next unrelated `mmap` could be handed. `MADV_REMOVE` alone is right; it
+  propagates through `i_mmap` and actually returns the memory.
+- **Quarantine is not needed here, and the reason is worth keeping.** The plan
+  has quarantine as Phase 2d, protecting against an address being rebound to a
+  different `(fd, offset, prot)`. Under strict 1:1 with a uniform granule that
+  cannot happen: the binding for an address in this region is *immutable*, so a
+  recycled slot recycles the address and the offset together and a stale mapping
+  is stale-but-identical. Quarantine becomes necessary in Phase 2, where the
+  arena's granules vary and the binding is not derivable.
+
+  `UnmapFromAllAddressSpaces()` was written for this and then removed: with the
+  1:1 layout nothing calls it, and shipping an unexercised walk over every
+  address space is worse than adding it back in Phase 5, where the GC needs it
+  and can test it.
+
+## Phase 2 — The arena
+
+**2a. The slot.** 512 GB at `0x530000000000` (next free above Caladan's
+relocated page pool at `0x510000000000` and stack pool at `0x520000000000`). One
+memfd, `ftruncate` to the slot size, `MFD_EXEC` where available with a fallback
+(memfs already does exactly this), then `F_SEAL_GROW | F_SEAL_SHRINK`.
+
+Sealing matters because the kernel enforces the size at **fault** time, not at
+mmap time — measured: `mmap` succeeds 4x past EOF and the access takes SIGBUS
+(`docs/traces/memfd_bounds.c`). The size is a backstop, never an allocator.
+
+**2b. Allocator and shadow map.** Both are
+`ExclusiveIntervalSet<T>` (`junction/base/interval_set.h`), which already backs
+`vmareas_` and `mem_areas_`; `AllocateMMRegion()` is the shape to copy. Give it
+a **pool allocator over a fixed, pre-reserved region**, because:
+
+- the fault handler consults the map, so a fault while consulting it recurses —
+  the pool must be eagerly mapped into every address space at creation;
+- its nodes hold pointers that must be valid in every mm, so it must live at a
+  fixed address;
+- fragmentation is a non-issue: `std::map` nodes are all one size, so this is a
+  slab, not a general allocator.
+
+Sizing: 102 live LibOS mappings today; at 100x headroom, 10K nodes of ~64 bytes
+is ~640 KB, about 160 pages to pre-fault per address space. Sub-millisecond
+against a ~142 us fork.
+
+**2c. Point the fault handler at the real shadow map** instead of the one-entry
+stand-in from Phase 1. Every lookup goes through the map — see "Growth" below
+for why deriving `offset` from `addr` is not kept as a fast path.
+
+**2d. Quarantine.** A freed range is punched but **not reused**. This is what
+makes lazy propagation correct: it converts every silent divergence into an
+absence.
+
+---
+
+### Phase 2 follow-on — make memfs a client of the arena
+
+Once the arena exists, memfs should stop having its own allocator, its own
+granule and its own rules, and become a client of it. Phase 1 deliberately gave
+memfs a private, strictly 1:1 regime because that was the smallest thing that
+fixed a real bug; it is not where this should end up.
+
+**What it buys:**
+
+- **The 256 MB granule and the 16384-file cap both disappear.** Both are
+  artifacts of fixed-size extents: every file reserves a full `kMaxSizeBytes` of
+  address space however small it is, and `kMaxFiles` is just
+  `kMaxMemfdExtent / kMaxSizeBytes`. The arena's allocator handles arbitrary
+  lengths, so a 4 KB file would cost 4 KB of VA and the limit would become total
+  bytes rather than a file count. Growth would use the same copy-free `mremap`
+  path as everything else.
+- **memfs gets GC.** Today it never unmaps an extent -- safe, because the
+  binding is immutable, but each address space keeps one 256 MB VMA per extent
+  it ever touched for the life of the process. The punch reclaims the physical
+  memory; nothing reclaims the VA or the VMA. Tombstones and cursors would.
+- **One fault path instead of two.** Phase 2c already forces the handler to
+  consult the shadow map, because quarantine and the arithmetic fast path
+  cannot coexist. If memfs keeps its own regime the handler carries both, and
+  the arithmetic one is exactly the shape that is unsafe wherever bindings can
+  change.
+
+And the general argument: the bug that motivated Phase 1 was memfs having its
+own allocation scheme that drifted from everything else. Two regimes is how that
+happens again.
+
+**What must not be shared: the backing object.** Guests map memfs files
+*directly* --
+
+```c
+// MemInode::MMap
+ksys_mmap(addr, length, prot, flags, memfs_extent_fd,
+          extent_offset_ * kMaxSizeBytes + off);
+```
+
+-- so that is a guest VMA over `memfs_extent_fd`. If memfs allocations came out
+of the arena's memfd, a guest mapping a file would hold a descriptor-backed VMA
+over the same object that holds Junction's heap, Caladan's slabs and every other
+guest's file data. Junction computes the offset and length, so it is bounded
+today, but any off-by-one there stops being a memfs bug and becomes a
+cross-guest LibOS memory disclosure.
+
+So share the *mechanism*, not the store: memfs keeps its own memfd and its own
+slot, and loses only its allocator, its granule and its private rules. The
+managed-slot registry is already per-slot with a per-slot `fd`
+(`RegisterManagedSlot`), so this costs nothing structurally.
+
+**Sequencing.** After Phase 2, as a refactor, with `scripts/memfs_test.sh`
+already in place as the regression net -- which makes the arena's first real
+client one that is already tested. Doing it before Phase 2 would mean building
+the general mechanism speculatively against a single caller, which is how a
+general mechanism ends up shaped exactly like its first caller.
+
+## Phase 3 — Route every allocation into the arena
+
+Two disjoint enforcement points, because they cover different code and this is
+measured, not assumed.
+
+The split is not "Junction versus Caladan". It is **which RIP window the
+`syscall` instruction sits in**, because that is the only thing the seccomp
+filter looks at. Two windows are allowlisted for the memory syscalls, and a
+mapping made from either one never traps and therefore cannot be intercepted at
+all:
+
+| window | contents |
+| --- | --- |
+| `[ksys_start, ksys_end)` | Junction's `ksys_mmap` and everything reaching it through the `KernelMMap*` wrappers |
+| `[base_syscall_start, base_syscall_end)` | **Caladan's own stubs** in `base/syscall.S`: `syscall_mmap`, `syscall_mprotect`, `syscall_madvise`, `syscall_mbind` |
+
+**3a. Everything in an allowlisted window must be edited.** Verified: the escape
+probe's `ksys_mmap` succeeded with no SIGSYS event.
+
+- Junction: `mm.cc` (5), `memfs.cc` (3), `jif.cc` (2), `perf.h`,
+  `linuxfile.cc`, `zpoline.cc`, `syscall.cc`, `shim/backend/init.cc` — plus
+  `memprobe.cc` (6) and `arena.cc` (2), which are ours and already know where
+  they are mapping.
+- **Caladan: `mem_map_anom()` (`base/mem.c:107`) and `runtime/stack.c:203`.**
+  These are the large-page pool and the stack pool -- the two allocators that
+  actually overflow and crash (`docs/pools-are-load-bearing.md`). They use
+  Caladan's allowlisted stubs, so no amount of SIGSYS work will catch them.
+  This is the correction to an earlier version of this document, which said
+  Caladan reached the kernel through libc `mmap` and would therefore be covered
+  by 3b. It is covered by neither until these two call sites are changed.
+
+**3b. Only the libc-routed callers are intercepted**, at the SIGSYS handler:
+
+- Junction's glibc: malloc arena growth, `dlopen`, pthread stacks. `brk` is
+  already forced to return 0 so the main malloc arena cannot grow that way.
+- Caladan's *libc* `mmap` callers, which are a different set from its stub
+  callers: `mem_map_file` (`base/mem.c:158`), the iokernel shm mapping
+  (`runtime/ioqueues.c:151`), and directpath
+  (`mlx5_init_external.c:118` and `:192`).
+
+The handler already sees these — today it re-executes the call natively and
+returns the result, which is why the trace comment there reads "landing in
+whichever address space this core is currently bound to". The hook exists; the
+redirection is what Phase 3 adds.
+
+**A note on the pools.** They are `MAP_SHARED` *anonymous*, not memfd-backed,
+which is why they have a hard cliff instead of a repairable fault: with no file
+behind them there is no `(fd, offset)` for a fault handler to reconstruct.
+Folding them into the arena is what turns that cliff into a fault, and it is
+the main reason 3a matters more than its position in this list suggests.
+
+All three operations must be handled, not just `mmap`:
+
+| trapped | arena implementation |
+| --- | --- |
+| `mmap` | allocate a VA range, map `offset = addr - base`, record it |
+| `mremap`, same size | **move the VMA to a fresh VA range, same offset.** Update the shadow entry, quarantine the old VA. No copy, no punch — the bytes never move. |
+| `mremap`, growing | extend the offset range in place if free, else stay VA-contiguous and fragment the offsets into several VMAs; see below |
+| `munmap` | punch the hole, quarantine the VA and offset ranges together |
+| `madvise(MADV_DONTNEED)` | translate to `MADV_REMOVE`; see below |
+
+`mremap` is not optional: glibc relocates large chunks on `realloc`
+(`docs/traces/realloc_probe.c` — `MREMAP_MAYMOVE`, and it moves). Intercepting
+`mmap` alone means the first large `realloc` breaks the invariant silently.
+
+**Why a plain move needs no copy.** The content lives at a memfd offset and
+stays there; only the virtual address changes. After mm A moves `[X, X+L)` to
+`[Y, Y+L)`:
+
+- mm B follows a fresh pointer to `Y` → nothing mapped → faults → the shadow map
+  says `Y -> (fd, K)` → mapped correctly;
+- mm B follows a stale pointer to `X` → still mapped to offset `K` → reads the
+  right bytes. More permissive than a single mm (which would fault), never
+  wrong;
+- nothing is ever placed at `X` again, because the allocator only hands out VA
+  ranges no mm has mapped. That is what quarantine buys.
+
+`docs/traces/arena_demo.c` shows the failure this avoids — but note it
+demonstrates the *strict 1:1, arithmetic-only* regime, where there is nowhere to
+record an exception and the copy is therefore forced. With a shadow map there
+is somewhere to record it, and the copy is not needed. The `copy` mode of that
+demo is the 1:1 fix, not the design here.
+
+**Growth: two allocators, no copy.** Keep *two* interval sets — one over the
+LibOS virtual address space, one over the memfd's offset space — instead of
+deriving one from the other. Then `mremap` with a larger size either finds the
+offsets past `K` free and extends in place, or keeps the range **contiguous in
+VA** while fragmenting it in the memfd. The latter is several VMAs over one
+logical buffer, all with the same protections, described by several shadow
+entries. Both spaces are enormous, so the fragmenting case should be rare, and
+neither case copies.
+
+This drops the arithmetic fast path — `offset` can no longer be derived from
+`addr` in general, so the fault handler always consults the shadow map. That is
+a simplification rather than a cost: one rule with no special cases, and a
+`std::map` lookup (~100 ns) on a path that is already a page fault.
+
+Quarantine then covers the **pair**: a VA range and its offset range are
+released together, once GC has unmapped the VA from every mm. Keeping them
+paired costs nothing and avoids reasoning about a stale VMA whose offset has
+been recycled underneath it.
+
+### Freeing means punching, and `MADV_DONTNEED` has to be translated
+
+Measured on a 64 MB memfd (`docs/traces/memfd_reclaim.c`):
+
+```
+after writing 64 MB                  resident in memfd:    64 MB
+after MADV_DONTNEED                  resident in memfd:    64 MB   first byte 0x78
+after munmap                         resident in memfd:    64 MB
+after FALLOC_FL_PUNCH_HOLE           resident in memfd:     0 MB
+remapped after punch                 first byte 0x00
+```
+
+Two rules follow.
+
+**Unmapping is not freeing.** Neither `munmap` nor `MADV_DONTNEED` returns a
+single page; only `PUNCH_HOLE` does. Every path that means "give this memory
+back" has to punch, or the arena grows monotonically and holds shmem pages
+resident forever. (There is 8 GB of swap here, so they are evictable in
+principle — but paging them is not the same as freeing them.)
+
+**`MADV_DONTNEED` silently changes meaning on the arena, and must be
+translated.** On private anonymous memory it discards, and subsequent reads
+return zeros. On a shared memfd mapping it drops only the caller's PTEs: the
+page survives and reads back `0x78` above. glibc uses `MADV_DONTNEED` to trim
+its heap, and large `calloc` relies on freshly obtained memory being zero — so a
+recycled arena range still holding old bytes would hand `calloc` dirty memory.
+
+The fix is exact: on arena ranges, translate `MADV_DONTNEED` to `MADV_REMOVE`.
+The measurement shows that restores precisely the semantics glibc expects —
+memory actually freed *and* subsequent reads zero — and fixes reclamation at the
+same time. For the same reason, **free must always punch**: it is what
+guarantees a recycled range reads as zeros.
+
+This has not bitten yet only because `InitAddressSpaces()` already sets
+`M_TRIM_THRESHOLD` to `INT_MAX`, disabling glibc trimming. That is a landmine,
+not a defence.
+
+---
+
+## Phase 4 — Fold the startup sweep into the arena
+
+`ShareLibOSMemory()` already does the hard part: it reads `/proc/self/maps`
+before the first guest and converts private-writable LibOS mappings to shared,
+with `AuditLibOSMemory()` checking the result. Two changes:
+
+- consolidate onto the **one** arena memfd (it currently creates 27, one per
+  mapping);
+- record each range into the shadow map as it goes, so the map is seeded by the
+  same pass that establishes the invariant.
+
+Keep the two-phase split. A sweep is more trustworthy than intercepting
+Caladan's startup, because it catches mappings nobody remembered — that is what
+the audit is for.
+
+The clone stack (`InitAddressSpaces`, 64 KB, `MAP_PRIVATE`) should either move
+into the arena or carry a comment saying why it is exempt; it is currently
+skipped by the audit silently.
+
+---
+
+## Phase 5 — GC by epoch, applied where it is cheap
+
+A range cannot be reused until every address space that materialised it has
+dropped its mapping. Nothing tells those address spaces on its own: a VMA in
+another mm is an independent kernel object, and `rmap` reaches it only for
+operations on the *backing object*, never because some other mm rearranged its
+own layout. So the removal has to be driven by us.
+
+The obvious way is to walk: bind a kthread to each mm in turn, unmap, bind back.
+That was the original plan here, and it is the worst part of it -- an ioctl per
+mm per reclaim, on a path that has to run with preemption disabled, in address
+spaces where the running thread's own stack does not exist.
+
+**Do it lazily instead, with a tombstone log and a per-mm cursor.**
+
+- freeing a range appends a **tombstone** `(addr, len, index)` to a global log;
+- each mm carries a **cursor**: the index up to which it has applied them;
+- when an mm is next loaded, it applies the tombstones past its cursor, up to a
+  batch limit, and advances;
+- a range leaves quarantine when `min(cursor)` over all live mms passes its
+  index.
+
+This is the same shape as Linux's lazy TLB invalidation, which reconciles
+`mm->context.tlb_gen` against the per-CPU `cpu_tlbstate.ctxs[].tlb_gen` in
+`switch_mm` rather than chasing every CPU at invalidation time.
+
+Three things it buys:
+
+- **the work happens in the mm that needs it, while that mm is loaded.** No
+  binding a kthread into somebody else's address space, no preemption
+  gymnastics, no ioctl per mm. The cross-address-space walk disappears from the
+  common path entirely;
+- **the quarantine release condition becomes exact and cheap.** `min(cursor)`
+  over live mms is epoch reclamation. It replaces both the "visit the sharers"
+  walk and the per-VMA membership bitmap that was going to optimize it -- the
+  cursor already encodes which mms are behind;
+- **the cost is bounded by the batch size**, and is paid at a switch that
+  already costs an ioctl.
+
+### Four things it needs to be correct
+
+**1. Mark in `on_sched`, apply somewhere else.** `on_sched` runs with preemption
+disabled, on the runtime stack, after `set_fsbase()` has already repointed `%fs`
+at the guest, one instruction from `__jmp_thread` (`lib/caladan/runtime/sched.c`).
+Issuing blocking `mmap`/`munmap` there -- with the TLB shootdowns they carry --
+is the "fault with preemption disabled" class of bug. `on_sched` should do
+nothing but compare the cursor and set a flag; the batch is applied at the next
+safe point, syscall entry being the natural one. Nothing is lost by deferring:
+the work has to happen before the range is *reused*, and the cursor gate
+already guarantees that.
+
+**2. Stragglers pin the epoch.** `min(cursor)` is held back by any mm that is
+not running, so a process blocked in a long `read()` stalls reclamation for
+everyone and the log grows without bound. It cannot be skipped: when it wakes it
+still holds the stale VMA. So the walk survives -- demoted from the common path
+to a **pressure-triggered fallback** that force-visits stragglers when the log
+or the quarantine crosses a threshold. Log length is the pressure signal.
+
+**3. The fault handler must stop being arithmetic-only.** Phase 1's handler
+repairs any address in a slot by computing `offset = addr - base`. Once ranges
+can be quarantined, a thread touching a tombstoned range would re-materialise
+the mapping the GC is retiring -- and after reuse, with the wrong binding. The
+handler has to consult the shadow map and refuse ranges that are not live. That
+is Phase 2c, and this is what makes it load-bearing rather than tidying:
+quarantine and the arithmetic fast path cannot coexist.
+
+**4. Apply means `munmap`.** Decided deliberately, so here is the tradeoff.
+
+`munmap` leaves a hole in the slot's `PROT_NONE` reservation, and the kernel's
+free-space search has never heard of our quarantine. In principle it could hand
+that address to the next `mmap(NULL, ...)` from Junction's glibc or Caladan, and
+then two address spaces hold different objects at the same address with neither
+faulting. The alternative is to re-reserve instead:
+
+```c
+mmap(addr, len, PROT_NONE, MAP_FIXED|MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE, -1, 0);
+```
+
+which keeps the invariant that every address in the slot is, in every mm,
+either an extent or the placeholder -- never absent.
+
+Measured, the risk does not currently materialise: the kernel allocates
+top-down from `mmap_base` (~128 TiB) and finds ~123 TiB of free space above a
+slot at `0x600000000000` long before it would descend into it. An unrelated
+`mmap(NULL)` issued against a deliberate hole landed outside it. So the
+reservation is defence-in-depth here, not load-bearing, and `munmap` is the
+simpler thing.
+
+Two notes for whoever revisits this:
+
+- the **tripwire** already exists. `AuditAddressSpaceCoherence()` diffs every
+  live address space's mappings, so a foreign mapping inside the slot shows up
+  as "absent here". That check works across address spaces, which is exactly
+  what `MAP_FIXED_NOREPLACE` cannot do -- `NOREPLACE` only tests the mm issuing
+  the call, and the collision can be established in a different one;
+- the **upgrade is cheap but not free** if it ever does bite. Re-reserving is
+  not an extra syscall -- `MAP_FIXED` subsumes the unmap -- but it is more work
+  inside the same call, because the kernel installs and merges a replacement
+  VMA. Measured over 2000 iterations on a 16 MB extent:
+
+  | | `munmap` | re-reserve |
+  | --- | --- | --- |
+  | untouched extent | 0.59 us | 1.15 us (+97%) |
+  | pages faulted in | 501 us | 502 us (noise) |
+
+  So it roughly doubles the cost of retiring a range that has no pages, and
+  disappears entirely once tearing down PTEs dominates. It also keeps the slot
+  at one VMA: measured 3 -> 1 on re-reserve, against 2 and a hole for `munmap`.
+
+  Note separately that `MAP_FIXED` cannot be the loud check -- it silently
+  replaces whatever is at the address and never refuses. Only
+  `MAP_FIXED_NOREPLACE` refuses, and only for the mm issuing it.
+
+### Freeing pages is a separate job from retiring VMAs
+
+Keep these apart; conflating them is a mistake this document made:
+
+| | what it does | who sees it |
+| --- | --- | --- |
+| `MADV_REMOVE` on the range | frees the object's pages | every mapper, automatically, via `i_mmap` |
+| tombstone + cursor | retires the stale VMAs | each mm, when it next runs |
+
+`MADV_REMOVE` does **not** unmap anything and does not zero anything eagerly. It
+punches the backing object: the folios are dropped from the page cache, and
+every PTE pointing at them is zapped through `unmap_mapping_range()`, which
+walks the object's `i_mmap` tree across every mm. The zeros appear later and
+lazily, when someone faults a hole in the sparse object and the kernel allocates
+a fresh zeroed page -- exactly like an anonymous fault. Verified across address
+spaces in `docs/traces/tlb_punch.c`: a child in a forked mm observes `0x00`
+after the parent punches.
+
+So the punch is what returns memory, and the GC is what removes the VMAs.
+Neither substitutes for the other. The protocol that follows:
+
+| who | when | does |
+| --- | --- | --- |
+| the freer | at free | `fallocate(PUNCH_HOLE)`, `munmap` its own VA, append the tombstone |
+| every other mm | at its cursor | `munmap` its VA. No punch: the pages are already gone |
+| the allocator | when `min(cursor)` passes the index | release the range from quarantine |
+
+There is no race over who punches. Freeing is one event in the shadow
+allocator, serialized by its lock; other address spaces never decide to free
+anything, they only apply tombstones. Exactly one punch, by construction.
+
+Punch with `fallocate(fd, FALLOC_FL_PUNCH_HOLE, off, len)` rather than
+`MADV_REMOVE`. `madvise` needs the range still mapped in the caller, which
+couples the punch to the freer's own unmap ordering; `fallocate` acts on the
+object whether or not anyone has it mapped. (memfs can keep `MADV_REMOVE` --
+it never unmaps -- but the arena should not inherit the constraint.)
+
+Note also that the punch's reclaim is not final until the last VMA is retired.
+A straggler that touches the range before applying its tombstone faults a fresh
+zero page back into the object, and the kernel serves that from the straggler's
+own VMA without Junction seeing it -- so the fault handler cannot refuse it.
+That is a use-after-free by the LibOS and out of contract, but it does mean the
+GC, not the punch, is what ultimately bounds memory.
+
+Two measurements still say the whole thing is close to free: **LibOS allocation
+events after init are 0** across all five traced workloads, and `max_map_count`
+here is 16777216 against 102 live mappings.
+
+## What needs no work
+
+- **directpath.** Two mappings, both `MAP_SHARED`, both in `mlx5_init_ext_late`,
+  reached once from `runtime_init` before the sweep. The UAR doorbell is per
+  *kthread*, so inheritance by `clone()` is required, not a hazard — and it is a
+  file mapping of the VFIO fd, so `unmap_mapping_range()` walks `i_mmap` and
+  finds every address space, exactly as with the memfd.
+- **iokernel shm, SysV segments, hugetlbfs pools.** Already `MAP_SHARED` and
+  established before the first guest, so `clone()` inherits them coherently.
+- ~~**Caladan's two runtime allocators** (`stack_create`, `lgpage_create`).
+  Pre-reserved and hooked; never overflowed across five workloads including 512
+  concurrent guests.~~ **Wrong, and measured wrong later.** Both overflow, and
+  both crash deterministically when they do: 8000 threads past the stack pool
+  (5/5), 17000 pipes past the large-page pool (3/3, pure guest code). The pools
+  are a *mitigation*, not infrastructure that needs no work — see
+  `docs/pools-are-load-bearing.md` for the two-branch comparison, and note what
+  they cost: RSS is a high-water mark that never returns (190.3 MB held after
+  3000 pipes were closed), `stack_reclaim()` is never called, 17 GB of address
+  space is reserved by guesswork, and there is a hard cliff at each edge.
+
+  This reframes the whole plan. The pools are not something the fix is built on
+  top of; they are what the fix **deletes**.
+- **Page-table / maple-tree sharing.** Rejected on constraint 1. The kernel
+  module stays switch-only, and `enable_pgtable_sharing` stays off.
+
+## Verification gates
+
+- `scripts/vm_test.sh` **must pass for the exact build before any `insmod`** —
+  a page-table bug took the host down once already.
+- `scripts/fork_test.sh` — 13/13 module, 46/46 native, 46/46 Junction.
+- `docs/traces/memfs_race.c` — must match native.
+- `--debug_libos_escape` — all shapes inside the slot.
+- `--debug_libos_alloc` — allocation visible from every address space.
+- The five-workload trace set, plus `scripts/directpath_trace.sh` when the NIC
+  can be reconfigured.

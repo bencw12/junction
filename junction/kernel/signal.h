@@ -367,6 +367,13 @@ class alignas(kCacheLineSize) SignalTable {
     return sa;
   }
 
+  // CopyFrom takes another table's dispositions. A forked child inherits its
+  // parent's handlers, so fork() needs this; the lock cannot be copied.
+  void CopyFrom(SignalTable &o) {
+    rt::SpinGuard g(o.lock_);
+    for (size_t i = 0; i < kNumSignals; i++) table_[i] = o.table_[i];
+  }
+
   // exchange_action sets a new action for a signal and returns the old one.
   k_sigaction exchange_action(int sig, k_sigaction sa) {
     assert_signal_valid(sig);

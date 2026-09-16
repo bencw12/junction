@@ -1,4 +1,5 @@
 
+#include "junction/kernel/proc.h"
 #include "junction/syscall/syscall.h"
 
 #include <cstring>
@@ -82,6 +83,10 @@ Status<void> SyscallInit() {
 unsigned long sys_dispatch(long arg0, long arg1, long arg2, long arg3,
                            long arg4, long arg5, long syscall) {
   if (unlikely(syscall >= SYS_NR)) return -ENOSYS;
+
+  // Recorded so Process::DumpAllThreads() can say what a blocked thread is
+  // blocked *in*. One store per system call.
+  if (likely(IsJunctionThread())) mythread().set_cur_syscall(syscall);
 
   return sys_tbl[syscall](arg0, arg1, arg2, arg3, arg4, arg5);
 }

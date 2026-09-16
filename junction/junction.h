@@ -69,6 +69,38 @@ class alignas(kCacheLineSize) JunctionCfg {
   [[nodiscard]] bool using_chroot() const { return chroot_path.size() > 0; }
   [[nodiscard]] bool zpoline() const { return zpoline_; }
 
+  // Whether guest processes may be given address spaces of their own. When
+  // false, Junction behaves as it did before multi-address-space support:
+  // every guest shares one address space and fork() reports ENOSYS.
+  [[nodiscard]] bool mas_enabled() const { return mas_enabled_; }
+
+  // Megabytes the LibOS should deliberately allocate through its own glibc on
+  // the first guest getpid(), to observe where such a mapping lands. Zero
+  // disables the probe. Diagnostic only.
+  [[nodiscard]] size_t debug_libos_alloc_mb() const {
+    return debug_libos_alloc_mb_;
+  }
+  [[nodiscard]] bool debug_libos_escape() const { return debug_libos_escape_; }
+
+  // Whether to diff the LibOS's mappings across every live address space after
+  // each fork. Diagnostic only; see AuditAddressSpaceCoherence().
+  [[nodiscard]] bool debug_as_audit() const { return debug_as_audit_; }
+
+  // Whether to deliberately violate the frozen-after-init invariant once, to
+  // test the check that reports it. See FrozenViolationProbe().
+  [[nodiscard]] bool debug_frozen_probe() const { return debug_frozen_probe_; }
+
+  // Seconds of no forward progress before the hang watchdog dumps every
+  // thread. Zero disables it.
+  [[nodiscard]] size_t debug_hang_watchdog_s() const {
+    return debug_hang_watchdog_s_;
+  }
+
+  // Path for the LibOS memory trace, empty when disabled.
+  [[nodiscard]] const std::string &get_memtrace_path() const {
+    return memtrace_path_;
+  }
+
   static void PrintOptions();
   Status<void> FillFromArgs(int argc, char *argv[]);
   void Print();
@@ -84,6 +116,13 @@ class alignas(kCacheLineSize) JunctionCfg {
   bool expecting_snapshot_;
   bool restore_populate_;
   bool zpoline_;
+  bool mas_enabled_;
+  std::string memtrace_path_;
+  size_t debug_libos_alloc_mb_{0};
+  bool debug_libos_escape_{false};
+  bool debug_as_audit_{false};
+  bool debug_frozen_probe_{false};
+  size_t debug_hang_watchdog_s_{0};
   uid_t gid_;
   uid_t uid_;
   std::string chroot_path;

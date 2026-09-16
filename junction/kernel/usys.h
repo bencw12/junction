@@ -17,6 +17,7 @@ extern "C" {
 #include <sys/utsname.h>
 #include <time.h>
 struct clone_args;
+struct rusage;
 struct rseq;
 }
 
@@ -171,6 +172,8 @@ long usys_clone(unsigned long clone_flags, unsigned long newsp,
                 uintptr_t parent_tidptr, uintptr_t child_tidptr,
                 unsigned long tls);
 long usys_clone3(clone_args *cl_args, size_t size);
+long usys_getrusage(int who, struct rusage *usage);
+long usys_fork();
 long usys_vfork();
 long usys_futex(uint32_t *uaddr, int futex_op, uint32_t val,
                 const struct timespec *timeout, uint32_t *uaddr2,

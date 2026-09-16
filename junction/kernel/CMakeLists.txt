@@ -1,11 +1,15 @@
 message(STATUS "Building junction kernel")
 
 set(SOURCES_C_CPP
+  arena.cc
+  as.cc
   elf.cc
   exec.cc
   futex.cc
   itimer.cc
   misc.cc
+  memprobe.cc
+  memtrace.cc
   mm.cc
   proc.cc
   random.cc

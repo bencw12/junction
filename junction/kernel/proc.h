@@ -347,6 +347,16 @@ class Thread {
     cur_trapframe_ = &tf;
   }
 
+  // The system call this thread is currently executing, for the thread dump.
+  // Set on entry to the dispatcher; stale once the call returns, which is
+  // harmless because it is only read for threads that are blocked inside one.
+  void set_cur_syscall(long nr) {
+    cold().cur_syscall_ = static_cast<int>(nr);
+  }
+  [[nodiscard]] int get_cur_syscall() const {
+    return cold().cur_syscall_;
+  }
+
   [[nodiscard]] bool in_kernel() const {
     return access_once(GetCaladanThread()->in_syscall);
   }
@@ -439,6 +449,7 @@ class Thread {
         : sighand_(th, oldth.get_sighand()), creds_(oldth.get_creds()) {}
     int xstate_;  // exit state
     int stopped_rax_;
+    int cur_syscall_{-1};  // see set_cur_syscall()
     ThreadSignalHandler sighand_;
     Credential creds_;
     std::atomic<size_t> ref_count_{1};
@@ -570,6 +581,12 @@ class Limits {
     overriden_limits[resource] = lim;
   }
 
+  // CopyFrom takes another process's limits; a forked child inherits them.
+  void CopyFrom(Limits &o) {
+    rt::SpinGuard g(o.lock);
+    overriden_limits = o.overriden_limits;
+  }
+
   template <typename Archive>
   void serialize(Archive &ar) {
     ar(overriden_limits);
@@ -655,6 +672,10 @@ class Process : public std::enable_shared_from_this<Process> {
   // Create a vforked process from this one.
   Status<std::shared_ptr<Process>> CreateProcessVfork(rt::ThreadWaker &&w);
 
+  // Create a forked process from this one: a new process whose address space
+  // holds a copy-on-write copy of this one's memory at the same addresses.
+  Status<std::shared_ptr<Process>> CreateProcessFork(const clone_args &cl_args);
+
   Status<Thread *> CreateThreadMain(const Thread &oldth);
   Status<Thread *> CreateThread(const Thread &oldth);
 
@@ -705,6 +726,12 @@ class Process : public std::enable_shared_from_this<Process> {
   }
 
   [[nodiscard]] unsigned int get_wait_state() const { return wait_state_; }
+
+  // Records that this process is being killed by an unhandled signal. Linux
+  // reports such a death as WIFSIGNALED with the signal number, not as an exit
+  // code, and wait() callers routinely distinguish the two.
+  void set_term_signal(int signo) { term_signal_ = signo; }
+  [[nodiscard]] int get_term_signal() const { return term_signal_; }
 
   void FillWaitInfo(siginfo_t &info) const;
   int GetWaitStatus() const;
@@ -771,6 +798,16 @@ class Process : public std::enable_shared_from_this<Process> {
     return d + accumulated_runtime_;
   }
 
+  // Dumps every process and thread in the system: what each thread is, whether
+  // it is runnable, and where it stopped.
+  //
+  // Exists because every conclusion about the fork-storm hang
+  // (docs/bug-fork-storm-hang.md) has so far been inferred from *host* thread
+  // state -- ten kthreads parked in ksched_ioctl, which says only "nothing is
+  // runnable" and nothing about which guest thread is waiting for what. This
+  // turns that inference into observation.
+  static void DumpAllThreads(const char *why);
+
   // Run a function for each process in the system.
   template <typename Func>
   static void ForEachProcess(Func func) {
@@ -779,11 +816,17 @@ class Process : public std::enable_shared_from_this<Process> {
     size_t cnt = 0;
     for (const auto &[pid, proc] : pid_to_proc_) {
       std::shared_ptr<Process> lck = proc->weak_from_this().lock();
-      if (!lck || lck->exited()) continue;
+      // Every reference taken here has to stay alive until the lock is
+      // released. Dropping the last one runs ~Process, which deregisters
+      // itself under this same non-recursive lock -- so filtering exited
+      // processes before the unlock would deadlock against ourselves. An
+      // empty pointer is safe to drop: there is nothing to destroy.
+      if (!lck) continue;
       procs[cnt++] = std::move(lck);
     }
     pid_map_lock_.Unlock();
-    for (size_t i = 0; i < cnt; i++) func(*procs[i].get());
+    for (size_t i = 0; i < cnt; i++)
+      if (!procs[i]->exited()) func(*procs[i].get());
   }
 
   // Run a function for each thread in this process. The function will be called
@@ -931,6 +974,7 @@ class Process : public std::enable_shared_from_this<Process> {
   pid_t sid_;               // session ID
   pid_t pgid_;              // the process group identifier
   int xstate_;              // exit state
+  int term_signal_{0};      // signal that killed this process, if any
   bool exited_{false};      // If true, the process has been killed
   bool doing_exec_{false};  // True during exec's teardown of existing threads
   rt::ThreadWaker exec_waker_;

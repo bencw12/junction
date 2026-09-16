@@ -1,6 +1,8 @@
 extern "C" {
+#include <runtime/interruptible_wait.h>
 #include <asm/prctl.h>
 #include <linux/futex.h>
+#include <sys/mman.h>
 #include <sys/prctl.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -24,8 +26,11 @@ extern "C" {
 #include "junction/bindings/sync.h"
 #include "junction/bindings/timer.h"
 #include "junction/junction.h"
+#include "junction/kernel/as.h"
+#include "junction/kernel/memtrace.h"
 #include "junction/kernel/futex.h"
 #include "junction/kernel/ksys.h"
+#include "junction/kernel/memprobe.h"
 #include "junction/kernel/mm.h"
 #include "junction/kernel/proc.h"
 #include "junction/kernel/usys.h"
@@ -119,12 +124,18 @@ void SetInitProc(std::shared_ptr<Process> proc) {
 
 long DoClone(clone_args *cl_args, uint64_t rsp) {
   bool do_vfork = false;
+  bool do_fork = false;
 
   switch (cl_args->flags & kCheckFlags) {
     case kVforkRequiredFlags:
       do_vfork = true;
       break;
     case kThreadRequiredFlags:
+      break;
+    case 0:
+      // Nothing is shared with the caller, so this is a fork: the child needs
+      // an address space of its own holding a copy of the caller's memory.
+      do_fork = true;
       break;
     default:
       return -ENOSYS;
@@ -139,6 +150,11 @@ long DoClone(clone_args *cl_args, uint64_t rsp) {
     waker.Arm();
     Status<std::shared_ptr<Process>> forkp =
         oldth.get_process().CreateProcessVfork(std::move(waker));
+    if (!forkp) return MakeCError(forkp);
+    tptr = (*forkp)->CreateThreadMain(oldth);
+  } else if (do_fork) {
+    Status<std::shared_ptr<Process>> forkp =
+        oldth.get_process().CreateProcessFork(*cl_args);
     if (!forkp) return MakeCError(forkp);
     tptr = (*forkp)->CreateThreadMain(oldth);
   } else {
@@ -213,6 +229,21 @@ void Thread::DestroyThread(Thread *th) {
 Thread::~Thread() {
   uint32_t *child_tid = get_child_tid();
   if (child_tid) {
+    // This writes *guest* memory, and DestroyThread() guarantees we are not
+    // the dying thread -- so the core may well be bound to some other
+    // process's address space. If it is, the zero lands at this address in the
+    // wrong address space: the waiter in the right one never sees its tid
+    // cleared, and the FUTEX_WAKE below wakes it only to find the value
+    // unchanged and block again. That is a hang, and it is indistinguishable
+    // from a lost wakeup unless you look here.
+    uint64_t want = proc_->get_mem_map().get_as_handle();
+    if (unlikely(GetActiveAddressSpace() != want)) {
+      static std::atomic_int reported{0};
+      if (reported.fetch_add(1, std::memory_order_relaxed) < 16)
+        LOG(WARN) << "thread exit: clear_child_tid write for tid " << tid_
+                  << " (pid " << proc_->get_pid() << ") in address space "
+                  << GetActiveAddressSpace() << ", want " << want;
+    }
     *child_tid = 0;
     FutexTable::GetFutexTable().Wake(child_tid);
   }
@@ -389,6 +420,78 @@ Status<std::shared_ptr<Process>> Process::CreateProcessVfork(
   return p;
 }
 
+Status<std::shared_ptr<Process>> Process::CreateProcessFork(
+    const clone_args &cl_args) {
+  if (unlikely(!MultiAddressSpaceEnabled())) return MakeError(ENOSYS);
+
+  // Serialize forks. Which ranges are left out of a clone is a property of the
+  // address space (MADV_DONTFORK is a VMA flag), so two clones cannot be in
+  // flight at once without stepping on each other's exclusions.
+  rt::MutexGuard fg(AddressSpaceForkLock());
+
+  Status<pid_t> pid = AllocPid(get_pgid(), get_sid());
+  if (!pid) return MakeError(pid);
+
+  // Every other guest's memory must stay out of the child's address space.
+  // Only other processes' memory maps qualify: the global region table also
+  // holds ranges the LibOS registered for itself, and those have to be present
+  // in every address space.
+  AddressRange own = mem_map_->get_reservation();
+  std::vector<AddressRange> exclude;
+  ForEachProcess([&](Process &p) {
+    AddressRange r = p.get_mem_map().get_reservation();
+    if (r.start == own.start) return;  // ours, or a vfork child sharing it
+    for (const AddressRange &e : exclude)
+      if (e.start == r.start) return;
+    exclude.push_back(r);
+  });
+
+  // CLONE_CHILD_SETTID asks for the child's tid to be stored in the child's
+  // memory. The child's memory does not exist yet, and once it does it is not
+  // reachable from here -- so write the value now and let the clone inherit
+  // it, then put the caller's own value back. Only the calling thread can see
+  // this location (it is in its TLS), so the window is harmless.
+  uint32_t *ctid = nullptr;
+  uint32_t saved_ctid = 0;
+  if (cl_args.flags & CLONE_CHILD_SETTID) {
+    ctid = reinterpret_cast<uint32_t *>(cl_args.child_tid);
+    if (ctid) {
+      saved_ctid = *ctid;
+      *ctid = static_cast<uint32_t>(*pid);
+    }
+  }
+
+  Status<uint64_t> as = CloneCurrentAddressSpace(exclude);
+
+  if (ctid) *ctid = saved_ctid;
+
+  if (!as) {
+    ReleasePid(*pid, get_pgid(), get_sid());
+    return MakeError(as);
+  }
+
+  // Each fork is a chance to notice what has diverged since the last one: the
+  // audit compares every live address space against this one.
+  // The probe first, so a single fork is enough to test the audit: it creates
+  // the divergence that the audit immediately afterwards has to find.
+  if (unlikely(GetCfg().debug_frozen_probe())) FrozenViolationProbe();
+  if (unlikely(GetCfg().debug_as_audit())) AuditAddressSpaceCoherence();
+
+  std::shared_ptr<MemoryMap> mm = MemoryMap::Fork(*mem_map_, *as);
+
+  rt::ThreadWaker no_waker;  // not a vfork: the parent keeps running
+  auto p = std::make_shared<Process>(*pid, std::move(mm), file_tbl_,
+                                     std::move(no_waker), shared_from_this(),
+                                     get_pgid(), get_fs(), get_sid());
+  p->get_signal_table().CopyFrom(signal_tbl_);
+  p->limits_.CopyFrom(limits_);
+  p->xstate_ = 0;
+
+  rt::SpinGuard g(shared_sig_q_);
+  child_procs_.push_back(p);
+  return p;
+}
+
 Status<Thread *> Process::CreateThreadMain(const Thread &oldth) {
   thread_t *th = thread_create(nullptr, 0);
   if (!th) return MakeError(ENOMEM);
@@ -447,14 +550,21 @@ int WaitStateToSi(unsigned int state) {
 void Process::FillWaitInfo(siginfo_t &info) const {
   info.si_signo = SIGCHLD;
   info.si_pid = get_pid();
+  info.si_uid = 0;
+  if (wait_state_ == kWaitableExited && term_signal_) {
+    info.si_status = term_signal_;
+    info.si_code = CLD_KILLED;
+    return;
+  }
   info.si_status = wait_status_;
   info.si_code = WaitStateToSi(wait_state_);
-  info.si_uid = 0;
 }
 
 int Process::GetWaitStatus() const {
   switch (wait_state_) {
     case kWaitableExited:
+      // A process killed by a signal is reported as such, not as an exit code.
+      if (term_signal_) return __W_EXITCODE(0, term_signal_);
       return __W_EXITCODE(wait_status_, 0);
     case kWaitableStopped:
       return __W_STOPCODE(SIGSTOP);
@@ -570,7 +680,7 @@ Status<pid_t> Process::DoWait(idtype_t idtype, id_t id, int options,
 
   Status<Process *> tmp;
 
-  rt::SpinGuard g(shared_sig_q_);
+  rt::UniqueLock<rt::Spin> g(shared_sig_q_);
 
   if (!nonblocking) {
     WaitInterruptible(shared_sig_q_, child_waiters_, [&, this] {
@@ -589,11 +699,135 @@ Status<pid_t> Process::DoWait(idtype_t idtype, id_t id, int options,
   }
 
   Process *p = *tmp;
-  if (infop) p->FillWaitInfo(*infop);
-  if (wstatus) *wstatus = p->GetWaitStatus();
+  siginfo_t info;
+  int status = p->GetWaitStatus();
+  if (infop) p->FillWaitInfo(info);
   pid_t pid = p->get_pid();
   if (!dont_reap) ReapChild(p);
+  g.Unlock();
+
+  // Write to the caller's memory only after dropping the lock. A fault here
+  // would otherwise be taken with preemption disabled, which is not
+  // recoverable -- and a bad pointer is the caller's mistake, not a reason to
+  // take down the container.
+  // Linux reaps the child and only then copies the status out, so a bad
+  // pointer costs the caller the exit status entirely: the child is already
+  // gone and a second wait reports ECHILD. Match that, wart and all.
+  MemoryMap &mm = get_mem_map();
+  if (infop) {
+    if (!mm.CheckAccess(infop, sizeof(*infop), PROT_WRITE))
+      return MakeError(EFAULT);
+    *infop = info;
+  }
+  if (wstatus) {
+    if (!mm.CheckAccess(wstatus, sizeof(*wstatus), PROT_WRITE))
+      return MakeError(EFAULT);
+    *wstatus = status;
+  }
   return pid;
+}
+
+void Process::DumpAllThreads(const char *why) {
+  LOG(ERR) << "==== thread dump: " << why << " ====";
+  // An anchor for resolving the rips below. The binary is PIE, so:
+  //   bias = this value - (nm junction_run | grep DumpAllThreads)
+  //   addr2line -e junction_run  <rip - bias>
+  LOG(ERR) << "text anchor: DumpAllThreads=0x" << std::hex
+           << reinterpret_cast<uintptr_t>(&Process::DumpAllThreads) << std::dec;
+
+  ForEachProcess([](Process &p) {
+    // ForEachThread runs its callback under a spin lock with preemption
+    // disabled, so collect first and print afterwards -- LOG() allocates.
+    struct Snap {
+      pid_t tid;
+      int syscall;
+      // The interruptible-wait refcount (inc/runtime/interruptible_wait.h):
+      // 65 = parked and armed, 66 = a signal also arrived, 0 = woken normally.
+      // A parked thread with no futex entry and an unexpected value here is
+      // the accounting bug, not a lost wakeup.
+      int interrupt_state;
+      bool in_kernel, ready, running, in_syscall, linked;
+      uint64_t rip, rsp;
+    };
+    constexpr size_t kMax = 64;
+    Snap snaps[kMax];
+    size_t n = 0;
+
+    p.ForEachThread([&](Thread &th) {
+      if (n == kMax) return;
+      thread_t *ct = th.GetCaladanThread();
+      snaps[n++] = Snap{th.get_tid(), th.get_cur_syscall(),
+                        static_cast<int>(atomic8_read(&ct->interrupt_state)),
+                        th.in_kernel(),
+                        ct->thread_ready,
+                        ct->thread_running,
+                        ct->in_syscall,
+                        ct->link_armed,
+                        ct->tf.rip,
+                        ct->tf.rsp};
+    });
+
+    // A poor-man's backtrace for each blocked thread.
+    //
+    // The blocked rip only ever says "parked in WaitInterruptible"; what
+    // matters is who called it, and -O3 leaves no frame pointer to walk. So
+    // scan the thread's stack for words that look like return addresses into
+    // our own text, which is enough to name the caller. Reading a parked
+    // thread's stack is safe: it is live memory in the shared stack pool and
+    // nothing is running on it.
+    const uintptr_t anchor =
+        reinterpret_cast<uintptr_t>(&Process::DumpAllThreads);
+    constexpr uintptr_t kTextWindow = 64UL << 20;
+    for (size_t i = 0; i < n; i++) {
+      const uint64_t *sp = reinterpret_cast<const uint64_t *>(snaps[i].rsp);
+      if (!sp) continue;
+      size_t found = 0;
+      for (size_t w = 0; w < 512 && found < 6; w++) {
+        uint64_t v = sp[w];
+        if (v > anchor - kTextWindow && v < anchor + kTextWindow)
+          LOG(ERR) << "  tid " << snaps[i].tid << " stack[" << w << "] = 0x"
+                   << std::hex << v << std::dec << "  (+0x" << std::hex
+                   << (v - (anchor - 0x19b930)) << std::dec << ")";
+        if (v > anchor - kTextWindow && v < anchor + kTextWindow) found++;
+      }
+    }
+
+    LOG(ERR) << "pid " << p.get_pid() << ": " << n << " thread(s)"
+             << ", as=" << p.get_mem_map().get_as_handle()
+             << ", wait_state=" << p.get_wait_state()
+             << (p.exited() ? " [exited]" : "");
+    for (size_t i = 0; i < n; i++) {
+      const Snap &s = snaps[i];
+      // ready/running are Caladan's view: a thread that is neither, and is
+      // linked onto a wait queue, is blocked. That is the state a lost wakeup
+      // leaves behind, and rip says on what.
+      LOG(ERR) << "  tid " << s.tid << " " << (s.running ? "RUNNING" : "")
+               << (s.ready ? "READY " : "")
+               << (!s.ready && !s.running ? "BLOCKED" : "")
+               << (s.linked ? " queued" : "")
+               << (s.in_syscall ? " in_syscall" : "")
+               << (s.in_kernel ? " in_kernel" : "") << " istate=" << s.interrupt_state
+               << " syscall=" << s.syscall
+               << " rip=0x" << std::hex
+               << s.rip << " rsp=0x" << s.rsp << std::dec;
+    }
+  });
+
+  // Futex waiters. Reading *key is a guest-memory read from whatever address
+  // space this thread is bound to, so the value is only meaningful for keys
+  // belonging to that address space -- print it anyway, flagged, because a
+  // wrong-looking value is itself the finding.
+  LOG(ERR) << "futex waiters (as=" << GetActiveAddressSpace() << "):";
+  size_t nw = 0;
+  FutexTable::GetFutexTable().ForEachWaiter(
+      [&](uint32_t *key, uint32_t bitset) {
+        if (nw++ >= 16) return;
+        LOG(ERR) << "  key=0x" << std::hex << reinterpret_cast<uintptr_t>(key)
+                 << " bitset=0x" << bitset << std::dec;
+      });
+  LOG(ERR) << "  " << nw << " waiter(s) total";
+
+  LOG(ERR) << "==== end thread dump ====";
 }
 
 void Process::ThreadStopWait() {
@@ -626,6 +860,11 @@ long usys_wait4(pid_t pid, int *wstatus, int options, struct rusage *ru) {
   const auto &[idtype, id] = PidtoId(pid);
   Status<pid_t> ret = myproc().DoWait(idtype, id, options, nullptr, wstatus);
   if (!ret) return MakeCError(ret);
+  if (ru) {
+    if (!myproc().get_mem_map().CheckAccess(ru, sizeof(*ru), PROT_WRITE))
+      return -EFAULT;
+    memset(ru, 0, sizeof(*ru));
+  }
   return *ret;
 }
 
@@ -634,12 +873,156 @@ long usys_waitid(int which, pid_t pid, siginfo_t *infop, int options,
   Status<pid_t> ret = myproc().DoWait(static_cast<idtype_t>(which), pid,
                                       options, infop, nullptr);
   if (!ret) return MakeCError(ret);
+  if (ru) {
+    if (!myproc().get_mem_map().CheckAccess(ru, sizeof(*ru), PROT_WRITE))
+      return -EFAULT;
+    memset(ru, 0, sizeof(*ru));
+  }
   return 0;
 }
 
 long usys_getppid() { return myproc().get_ppid(); }
 
-long usys_getpid() { return myproc().get_pid(); }
+long usys_getpid() {
+  // Diagnostic probe: allocate through Junction's own glibc while a guest is
+  // the current address space, and see where the mapping ends up. glibc has no
+  // brk here (the seccomp handler returns 0 for it), so an allocation past its
+  // pre-grown cushion goes to mmap, which seccomp traps and executes natively
+  // -- against whichever address space this core is bound to.
+  static uintptr_t debug_libos_ptr = 0;
+  static uint64_t debug_libos_as = 0;
+
+  if (unlikely(GetCfg().debug_libos_escape()) && myproc().get_pid() != 1) {
+    static std::atomic_bool escape_done{false};
+    bool e = false;
+    if (escape_done.compare_exchange_strong(e, true)) RunLibOSEscapeProbe();
+  }
+
+  // Deliberately provoke the case the memfd arena exists to fix: the LibOS
+  // allocating through its own glibc while a *forked* guest's address space is
+  // the one loaded on this core. Fires once, from a child, so the active
+  // address space is a clone rather than the root.
+  if (unlikely(GetCfg().debug_libos_alloc_mb() > 0) &&
+      myproc().get_pid() != 1) {
+    static std::atomic_bool done{false};
+    bool expected = false;
+    if (done.compare_exchange_strong(expected, true)) {
+      size_t len = GetCfg().debug_libos_alloc_mb() << 20;
+      uint64_t guest_fs = GetFSBase();
+      LOG(INFO) << "debug: guest pid " << myproc().get_pid() << " as="
+                << GetActiveAddressSpace() << " guest fsbase=0x" << std::hex
+                << guest_fs << std::dec
+                << " preempt_enabled=" << (preempt_enabled() ? 1 : 0)
+                << " (must work with preemption ENABLED)";
+
+      // Junction's glibc keeps its arena pointer and tcache in TLS, and a guest
+      // syscall runs on the *guest's* TCB -- calling malloc with this fsbase
+      // reads a foreign glibc's TLS layout and dies. Restore the LibOS fsbase
+      // so we are measuring the address space, not the TLS.
+      SetFSBase(perthread_read(runtime_fsbase));
+
+      // No preempt_disable() here on purpose. The trap handler now classifies
+      // on the trapping rip, so this must work with preemption enabled -- which
+      // is the state every guest syscall handler runs in.
+      void *p = std::malloc(len);
+      if (p) std::memset(p, 0xab, len);
+
+      uintptr_t pa = reinterpret_cast<uintptr_t>(p);
+      SetFSBase(guest_fs);
+
+      LOG(INFO) << "debug: LibOS malloc(" << (len >> 20) << " MB) -> 0x"
+                << std::hex << pa << std::dec << " ["
+                << (!pa ? "failed"
+                        : pa < kVirtualAreaMax
+                              ? "GUEST-RANGE: owned by a guest, invisible to "
+                                "every other address space"
+                              : "libos-range")
+                << "] in address space " << GetActiveAddressSpace();
+      debug_libos_ptr = pa;
+      debug_libos_as = GetActiveAddressSpace();
+    }
+  }
+
+  // ...and, from a different address space, ask the host whether that mapping
+  // exists here. msync() reports ENOMEM for an unmapped range without faulting,
+  // so this answers the question the crash would otherwise answer for us.
+  if (unlikely(GetCfg().debug_libos_alloc_mb() > 0) && debug_libos_ptr != 0 &&
+      GetActiveAddressSpace() != debug_libos_as) {
+    uintptr_t pa = debug_libos_ptr;
+    debug_libos_ptr = 0;
+    // Control: LibOS text, mapped long before any fork, must be visible from
+    // every address space. If this said ABSENT the probe would be measuring
+    // its own bug rather than Junction's.
+    uintptr_t control = reinterpret_cast<uintptr_t>(&usys_getpid);
+    // Ask the host which mappings this address space actually has. Going
+    // through /proc/self/maps rather than msync() because the seccomp filter
+    // answers ENOSYS for msync, and because the maps line also shows what the
+    // range became.
+    char line[256];
+    auto lookup = [&](uintptr_t want) -> bool {
+    bool present = false;
+    int n = 0;
+    int fd = ksys_open("/proc/thread-self/maps", O_RDONLY, 0);
+    if (fd >= 0) {
+      char buf[4096];
+      ssize_t got;
+      off_t pos = 0;
+      while (!present &&
+             (got = ksys_pread(fd, buf, sizeof(buf), pos)) > 0) {
+        pos += got;
+        for (ssize_t i = 0; i < got; i++) {
+          if (buf[i] != '\n') {
+            if (n < static_cast<int>(sizeof(line)) - 1) line[n++] = buf[i];
+            continue;
+          }
+          line[n] = '\0';
+          uintptr_t lo = 0, hi = 0;
+          int j = 0;
+          auto hex = [&](uintptr_t &out) {
+            out = 0;
+            while (line[j]) {
+              char c = line[j];
+              int d;
+              if (c >= '0' && c <= '9') d = c - '0';
+              else if (c >= 'a' && c <= 'f') d = c - 'a' + 10;
+              else break;
+              out = (out << 4) | static_cast<uintptr_t>(d);
+              j++;
+            }
+          };
+          hex(lo);
+          if (line[j] == '-') { j++; hex(hi); }
+          if (lo && want >= lo && want < hi) { present = true; break; }
+          n = 0;
+        }
+      }
+      ksys_close(fd);
+    }
+    return present;
+    };
+    bool ctl = lookup(control);
+    bool present = lookup(pa);
+    LOG(INFO) << "debug: address space " << GetActiveAddressSpace()
+              << " looking for the LibOS mapping made in address space "
+              << debug_libos_as << " at 0x" << std::hex << pa << std::dec
+              << ": "
+              << (present ? "PRESENT"
+                          : "ABSENT -- the LibOS allocated memory that this "
+                            "address space cannot see");
+    // Now actually use it, the way any LibOS code holding a pointer into its
+    // own heap would. This is the crash: glibc's free lists are shared LibOS
+    // state, so a chunk handed out here is one another address space mapped.
+    if (!present) {
+      LOG(INFO) << "debug: writing to it from this address space anyway...";
+      *reinterpret_cast<volatile char *>(pa) = 0x5a;
+      LOG(INFO) << "debug: write succeeded (unexpected)";
+    }
+    LOG(INFO) << "debug:   control (LibOS text at 0x" << std::hex << control
+              << std::dec << ", mapped before the fork): "
+              << (ctl ? "PRESENT, as expected" : "ABSENT -- probe is broken");
+  }
+  return myproc().get_pid();
+}
 
 long usys_gettid() { return mythread().get_tid(); }
 
@@ -697,6 +1080,21 @@ long usys_set_tid_address(int *tidptr) {
   Thread &tstate = mythread();
   tstate.set_child_tid(reinterpret_cast<uint32_t *>(tidptr));
   return tstate.get_tid();
+}
+
+long usys_fork() {
+  clone_args cl_args;
+  memset(&cl_args, 0, sizeof(cl_args));
+
+  // A bare fork() shares nothing with its parent and reports the child's death
+  // with SIGCHLD. glibc has not used this system call since it started needing
+  // CLONE_CHILD_SETTID, but programs still call it directly.
+  cl_args.flags = 0;
+  cl_args.exit_signal = SIGCHLD;
+
+  long ret = DoClone(&cl_args, mythread().GetSyscallFrame().GetRsp());
+  if (unlikely(GetCfg().strace_enabled())) LogSyscallDirect(ret, "fork");
+  return ret;
 }
 
 long usys_vfork() {

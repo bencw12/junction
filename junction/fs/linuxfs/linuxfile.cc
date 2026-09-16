@@ -103,6 +103,8 @@ Status<void *> LinuxFile::MMap(void *addr, size_t length, int prot, int flags,
   CheckFd();
   assert(!(flags & MAP_ANONYMOUS));
   intptr_t ret = ksys_mmap(addr, length, prot, flags, fd_, off);
+  TRACE_MEM(kGuestSyscall, "mmap-file", addr, length, prot, flags, fd_, off,
+            ret);
   if (ret < 0) return MakeError(-ret);
   return reinterpret_cast<void *>(ret);
 }

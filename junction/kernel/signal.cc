@@ -18,6 +18,8 @@ void thread_finish_yield(void);
 #include "junction/bindings/log.h"
 #include "junction/bindings/stack.h"
 #include "junction/junction.h"
+#include "junction/kernel/arena.h"
+#include "junction/kernel/as.h"
 #include "junction/kernel/proc.h"
 #include "junction/kernel/sigframe.h"
 #include "junction/kernel/usys.h"
@@ -97,6 +99,8 @@ int sigsegv_sigcontext_to_prot(const struct sigcontext &context) {
 // A signal handler that can be injected into a program to cleanly kill it
 extern "C" void SigKillHandler(int signo, siginfo_t *info, void *c) {
   assert_stack_is_aligned();
+  // Remember what killed us so that wait() can report WIFSIGNALED.
+  myproc().set_term_signal(signo);
   junction_fncall_enter(128 + signo, 0, 0, 0, 0, 0, __NR_exit_group);
   std::unreachable();
 }
@@ -527,6 +531,7 @@ std::optional<k_sigaction> ThreadSignalHandler::GetAction(int sig) {
 
 void SynchronousKill(Thread &th, const KernelSignalTf &sigframe,
                      int signo = SIGSEGV) {
+  th.get_process().set_term_signal(signo);
   uint64_t rsp = th.get_syscall_stack_rsp();
   KernelSignalTf &stack_tf = sigframe.CloneTo(&rsp);
   k_sigframe &new_frame = stack_tf.GetFrame();
@@ -619,14 +624,33 @@ void HandlePageFaultOnSyscallStack(KernelSignalTf &frame, int required_prot,
   // Re-enable preemption after switching off runtime stack.
   preempt_enable();
 
-  // Give the memory map the first chance to see the page fault.
-  bool fault_handled = myth.get_process().get_mem_map().HandlePageFault(
-      reinterpret_cast<uintptr_t>(info.si_addr), required_prot, time);
+  // A fault in a managed LibOS region means this address space never received
+  // a mapping the LibOS made after it was cloned. Repair it and retry the
+  // faulting instruction, which is what the unwind below does.
+  //
+  // Tried before the memory map because a managed address is never guest
+  // memory: the regions sit above kVirtualAreaMax, where no guest can be given
+  // an address, so the map has nothing to say about them.
+  bool fault_handled =
+      RepairManagedFault(reinterpret_cast<uintptr_t>(info.si_addr)) ||
+      myth.get_process().get_mem_map().HandlePageFault(
+          reinterpret_cast<uintptr_t>(info.si_addr), required_prot, time);
 
   if (!fault_handled) {
     // We don't expect faults in the Junction kernel; crash.
-    if (fstatus != FaultStatus::kNotInSyscall)
+    if (fstatus != FaultStatus::kNotInSyscall) {
+      LOG(ERR) << "segfault in syscall handler: addr=" << std::hex
+               << reinterpret_cast<uintptr_t>(info.si_addr)
+               << " rip=" << frame.GetRip() << " rsp=" << frame.GetRsp()
+               << std::dec << " pid=" << myth.get_process().get_pid()
+               << " as=" << GetActiveAddressSpace() << " want_as="
+               << myth.get_process().get_mem_map().get_as_handle();
+      // The overwhelmingly likely cause is a LibOS mapping this address space
+      // never received. Say so here rather than leaving it to be rediscovered:
+      // we are aborting anyway, so the cost does not matter.
+      if (GetCfg().debug_as_audit()) AuditAddressSpaceCoherence();
       print_msg_abort("unhandled segfault while in Junction syscall handler");
+    }
 
     // Preemption must be disabled before moving data to the syscall stack.
     preempt_disable();
@@ -668,8 +692,15 @@ extern "C" void synchronous_signal_handler(int signo, siginfo_t *info,
   if (unlikely(!thread_self()))
     print_msg_abort("Unexpected signal delivered to Caladan code");
 
-  if (unlikely(!IsJunctionThread()))
+  if (unlikely(!IsJunctionThread())) {
+    auto *uc_dbg = k_sigframe::FromUcontext(reinterpret_cast<k_ucontext *>(context));
+    LOG(ERR) << "signal " << signo << " on a non-Junction thread: addr="
+             << std::hex << reinterpret_cast<uintptr_t>(info->si_addr)
+             << " rip=" << uc_dbg->uc.uc_mcontext.rip
+             << " rsp=" << uc_dbg->uc.uc_mcontext.rsp << std::dec
+             << " as=" << GetActiveAddressSpace();
     print_msg_abort("Unexpected signal delivered to Junction code");
+  }
 
   auto uc = k_sigframe::FromUcontext(reinterpret_cast<k_ucontext *>(context));
 
@@ -701,6 +732,13 @@ extern "C" void synchronous_signal_handler(int signo, siginfo_t *info,
           mm.HandlePageFault(reinterpret_cast<uintptr_t>(info->si_addr), prot,
                              time))
         return;
+      LOG(ERR) << "fault with preemption disabled: addr=" << std::hex
+               << reinterpret_cast<uintptr_t>(info->si_addr)
+               << " rip=" << uc->uc.uc_mcontext.rip
+               << " rsp=" << uc->uc.uc_mcontext.rsp << std::dec
+               << " pid=" << myth.get_process().get_pid()
+               << " as=" << GetActiveAddressSpace() << " want_as="
+               << myth.get_process().get_mem_map().get_as_handle();
       // Try to cleanly kill this program.
       if (prev_tf) SynchronousKill(myth, *prev_tf);
       print_msg_abort("signal delivered while preemption is disabled");
@@ -720,6 +758,15 @@ extern "C" void synchronous_signal_handler(int signo, siginfo_t *info,
   }
 
   if (unlikely(was_preempt_disabled || IsOnRuntimeStack(uc->GetRsp()))) {
+    LOG(ERR) << "synchronous signal " << signo << " in LibOS context: addr="
+             << std::hex << reinterpret_cast<uintptr_t>(info->si_addr)
+             << " rip=" << uc->uc.uc_mcontext.rip
+             << " rsp=" << uc->uc.uc_mcontext.rsp << std::dec
+             << " preempt_off=" << was_preempt_disabled
+             << " on_rt_stack=" << IsOnRuntimeStack(uc->GetRsp())
+             << " pid=" << myth.get_process().get_pid()
+             << " as=" << GetActiveAddressSpace() << " want_as="
+             << myth.get_process().get_mem_map().get_as_handle();
     if (prev_tf) SynchronousKill(myth, *prev_tf);
     print_msg_abort("signal delivered while preemption is disabled");
   }
@@ -951,6 +998,10 @@ bool ThreadSignalHandler::EnqueueSignal(const siginfo_t &info) {
 extern "C" void on_sched(thread_t *th) {
   assert(th->junction_thread);
   Thread &myth = Thread::fromCaladanThread(th);
+  // Put this core in the guest's address space. Threads of the same process
+  // share one, so switching between them costs a comparison and nothing else;
+  // only moving a core between processes reaches the kernel.
+  ActivateAddressSpace(myth.get_process().get_mem_map().get_as_handle());
   myth.get_rseq().fixup(myth);
 }
 

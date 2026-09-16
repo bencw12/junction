@@ -35,3 +35,18 @@ junction-ctl/src/control_response_generated.rs
 ._*
 
 run.202*
+
+# Multi-address-space work: build artifacts
+.cache/
+kern/*.ko
+kern/*.mod
+kern/*.mod.c
+kern/modules.order
+kern/Module.symvers
+kern/as_test
+bench/fork/fork_stress
+bench/fork/fork_latency
+bench/fork/as_demo
+bench/fork/sched_latency
+fork-test
+kern/.*.cmd

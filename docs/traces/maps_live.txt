@@ -1,0 +1,126 @@
+00200000-00201000 rw-s 00000000 00:01 23163                              /memfd:junction_libos (deleted)
+00201000-00202000 r-xp 0026a000 fc:00 21371106                           /home/bcwh/git/forking_junction/junction/build/junction/junction_run
+00202000-00203000 rw-p 00000000 00:00 0 
+4ff000000000-4ffffddb7000 ---p 00000000 00:00 0 
+4ffffddb7000-4ffffddba000 rw-p 00000000 00:00 0 
+4ffffddba000-4ffffddde000 r--p 00000000 fc:00 20758202                   /home/bcwh/git/forking_junction/junction/install/lib/libc.so.6
+4ffffddde000-4ffffdf54000 r-xp 00024000 fc:00 20758202                   /home/bcwh/git/forking_junction/junction/install/lib/libc.so.6
+4ffffdf54000-4ffffdfac000 r--p 0019a000 fc:00 20758202                   /home/bcwh/git/forking_junction/junction/install/lib/libc.so.6
+4ffffdfac000-4ffffdfb0000 r--p 001f1000 fc:00 20758202                   /home/bcwh/git/forking_junction/junction/install/lib/libc.so.6
+4ffffdfb0000-4ffffdfb2000 rw-p 001f5000 fc:00 20758202                   /home/bcwh/git/forking_junction/junction/install/lib/libc.so.6
+4ffffdfb2000-4ffffdfc1000 rw-p 00000000 00:00 0 
+4ffffdfc1000-4ffffefc1000 ---p 00000000 00:00 0 
+4ffffefc1000-4ffffffc1000 rw-p 00000000 00:00 0 
+4ffffffc1000-4ffffffc2000 r--p 00000000 fc:00 4607183                    /tmp/claude-1006/-home-bcwh-git-forking-junction/102185bc-3627-4cc6-a212-792ca069ee87/scratchpad/sleeper
+4ffffffc2000-4ffffffc3000 r-xp 00001000 fc:00 4607183                    /tmp/claude-1006/-home-bcwh-git-forking-junction/102185bc-3627-4cc6-a212-792ca069ee87/scratchpad/sleeper
+4ffffffc3000-4ffffffc4000 r--p 00002000 fc:00 4607183                    /tmp/claude-1006/-home-bcwh-git-forking-junction/102185bc-3627-4cc6-a212-792ca069ee87/scratchpad/sleeper
+4ffffffc4000-4ffffffc5000 r--p 00002000 fc:00 4607183                    /tmp/claude-1006/-home-bcwh-git-forking-junction/102185bc-3627-4cc6-a212-792ca069ee87/scratchpad/sleeper
+4ffffffc5000-4ffffffc6000 rw-p 00003000 fc:00 4607183                    /tmp/claude-1006/-home-bcwh-git-forking-junction/102185bc-3627-4cc6-a212-792ca069ee87/scratchpad/sleeper
+4ffffffc6000-4ffffffc7000 r--p 00000000 fc:00 20758262                   /home/bcwh/git/forking_junction/junction/install/lib/ld-linux-x86-64.so.2
+4ffffffc7000-4fffffff0000 r-xp 00001000 fc:00 20758262                   /home/bcwh/git/forking_junction/junction/install/lib/ld-linux-x86-64.so.2
+4fffffff0000-4fffffff1000 r-xp 0002a000 fc:00 20758262                   /home/bcwh/git/forking_junction/junction/install/lib/ld-linux-x86-64.so.2
+4fffffff1000-4fffffffb000 r--p 0002b000 fc:00 20758262                   /home/bcwh/git/forking_junction/junction/install/lib/ld-linux-x86-64.so.2
+4fffffffb000-4fffffffe000 r--p 00035000 fc:00 20758262                   /home/bcwh/git/forking_junction/junction/install/lib/ld-linux-x86-64.so.2
+4fffffffe000-500000000000 rw-p 00038000 fc:00 20758262                   /home/bcwh/git/forking_junction/junction/install/lib/ld-linux-x86-64.so.2
+510000000000-510040000000 rw-s 00000000 00:01 197                        /dev/zero (deleted)
+520000000000-520400000000 rw-s 00000000 00:01 198                        /dev/zero (deleted)
+561454a15000-561454a93000 r--p 00000000 fc:00 21371106                   /home/bcwh/git/forking_junction/junction/build/junction/junction_run
+561454a93000-561454c7f000 r-xp 0007e000 fc:00 21371106                   /home/bcwh/git/forking_junction/junction/build/junction/junction_run
+561454c80000-561454d07000 r--p 0026b000 fc:00 21371106                   /home/bcwh/git/forking_junction/junction/build/junction/junction_run
+561454d07000-561454d12000 r--p 002f1000 fc:00 21371106                   /home/bcwh/git/forking_junction/junction/build/junction/junction_run
+561454d12000-561454d17000 rw-s 00000000 00:01 23164                      /memfd:junction_libos (deleted)
+561454d17000-561454e80000 rw-s 00000000 00:01 23165                      /memfd:junction_libos (deleted)
+5614652c4000-56146931e000 rw-s 00000000 00:01 23166                      /memfd:junction_libos (deleted)
+7ffb80000000-7ffb80031000 rw-s 00000000 00:01 23167                      /memfd:junction_libos (deleted)
+7ffb80031000-7ffb84000000 ---p 00000000 00:00 0 
+7ffb88000000-7ffb88031000 rw-s 00000000 00:01 23168                      /memfd:junction_libos (deleted)
+7ffb88031000-7ffb8c000000 ---p 00000000 00:00 0 
+7ffb8c000000-7ffb8c031000 rw-s 00000000 00:01 23169                      /memfd:junction_libos (deleted)
+7ffb8c031000-7ffb90000000 ---p 00000000 00:00 0 
+7ffb90000000-7ffb90031000 rw-s 00000000 00:01 23170                      /memfd:junction_libos (deleted)
+7ffb90031000-7ffb94000000 ---p 00000000 00:00 0 
+7ffb94000000-7ffb94031000 rw-s 00000000 00:01 23171                      /memfd:junction_libos (deleted)
+7ffb94031000-7ffb98000000 ---p 00000000 00:00 0 
+7ffb98000000-7ffb98031000 rw-s 00000000 00:01 23172                      /memfd:junction_libos (deleted)
+7ffb98031000-7ffb9c000000 ---p 00000000 00:00 0 
+7ffb9c000000-7ffb9c031000 rw-s 00000000 00:01 23173                      /memfd:junction_libos (deleted)
+7ffb9c031000-7ffba0000000 ---p 00000000 00:00 0 
+7ffba0000000-7ffba0031000 rw-s 00000000 00:01 23174                      /memfd:junction_libos (deleted)
+7ffba0031000-7ffba4000000 ---p 00000000 00:00 0 
+7ffba6e00000-7ffba7600000 rw-s 00000000 00:01 205                        /dev/zero (deleted)
+7ffba8000000-7ffba8031000 rw-s 00000000 00:01 23175                      /memfd:junction_libos (deleted)
+7ffba8031000-7ffbac000000 ---p 00000000 00:00 0 
+7ffbae6aa000-7ffbaeeaa000 rw-s 00000000 00:01 207                        /dev/zero (deleted)
+7ffbaeeaa000-7ffbaf6aa000 rw-s 00000000 00:01 206                        /dev/zero (deleted)
+7ffbaf6aa000-7ffbafeaa000 rw-s 00000000 00:01 204                        /dev/zero (deleted)
+7ffbafeaa000-7ffbb06aa000 rw-s 00000000 00:01 203                        /dev/zero (deleted)
+7ffbb06aa000-7ffbb0eaa000 rw-s 00000000 00:01 202                        /dev/zero (deleted)
+7ffbb0eaa000-7ffbb16aa000 rw-s 00000000 00:01 201                        /dev/zero (deleted)
+7ffbb16aa000-7ffbb1eaa000 rw-s 00000000 00:01 200                        /dev/zero (deleted)
+7ffbb1eaa000-7ffbb26aa000 rw-s 00000000 00:01 199                        /dev/zero (deleted)
+7ffbb26aa000-7ffbb2800000 rw-s 00000000 00:01 23176                      /memfd:junction_libos (deleted)
+7ffbb2800000-7ffbb6a00000 rw-s 00000000 00:10 79433                      /memfd:iok_signals (deleted)
+7ffbb6a00000-7ffbd6a00000 r--s 00000000 00:10 0                          /SYSV696d736b (deleted)
+7ffbd6a00000-7ffbd6c00000 rw-s 00000000 00:10 79432                      /anon_hugepage (deleted)
+7ffbd6c00000-7ffbd7400000 ---p 00000000 00:00 0 
+7ffbd7400000-7ffbd7428000 r--p 00000000 fc:00 2260006                    /usr/lib/x86_64-linux-gnu/libc.so.6
+7ffbd7428000-7ffbd75b1000 r-xp 00028000 fc:00 2260006                    /usr/lib/x86_64-linux-gnu/libc.so.6
+7ffbd75b1000-7ffbd7600000 r--p 001b1000 fc:00 2260006                    /usr/lib/x86_64-linux-gnu/libc.so.6
+7ffbd7600000-7ffbd7604000 r--p 001ff000 fc:00 2260006                    /usr/lib/x86_64-linux-gnu/libc.so.6
+7ffbd7604000-7ffbd7606000 rw-s 00000000 00:01 23177                      /memfd:junction_libos (deleted)
+7ffbd7606000-7ffbd7613000 rw-s 00000000 00:01 23178                      /memfd:junction_libos (deleted)
+7ffbd7717000-7ffbd7727000 r--p 00000000 fc:00 2260010                    /usr/lib/x86_64-linux-gnu/libm.so.6
+7ffbd7727000-7ffbd77a6000 r-xp 00010000 fc:00 2260010                    /usr/lib/x86_64-linux-gnu/libm.so.6
+7ffbd77a6000-7ffbd77fe000 r--p 0008f000 fc:00 2260010                    /usr/lib/x86_64-linux-gnu/libm.so.6
+7ffbd77fe000-7ffbd77ff000 r--p 000e7000 fc:00 2260010                    /usr/lib/x86_64-linux-gnu/libm.so.6
+7ffbd77ff000-7ffbd7800000 rw-s 00000000 00:01 23179                      /memfd:junction_libos (deleted)
+7ffbd7800000-7ffbd789d000 r--p 00000000 fc:00 2229189                    /usr/lib/x86_64-linux-gnu/libstdc++.so.6.0.33
+7ffbd789d000-7ffbd79e5000 r-xp 0009d000 fc:00 2229189                    /usr/lib/x86_64-linux-gnu/libstdc++.so.6.0.33
+7ffbd79e5000-7ffbd7a6c000 r--p 001e5000 fc:00 2229189                    /usr/lib/x86_64-linux-gnu/libstdc++.so.6.0.33
+7ffbd7a6c000-7ffbd7a77000 r--p 0026b000 fc:00 2229189                    /usr/lib/x86_64-linux-gnu/libstdc++.so.6.0.33
+7ffbd7a77000-7ffbd7a7a000 rw-s 00000000 00:01 23180                      /memfd:junction_libos (deleted)
+7ffbd7a7a000-7ffbd7a7e000 rw-s 00000000 00:01 23181                      /memfd:junction_libos (deleted)
+7ffbd7b32000-7ffbd7b5d000 rw-s 00000000 00:01 23182                      /memfd:junction_libos (deleted)
+7ffbd7b5d000-7ffbd7b61000 r--p 00000000 fc:00 2232507                    /usr/lib/x86_64-linux-gnu/libgcc_s.so.1
+7ffbd7b61000-7ffbd7b85000 r-xp 00004000 fc:00 2232507                    /usr/lib/x86_64-linux-gnu/libgcc_s.so.1
+7ffbd7b85000-7ffbd7b89000 r--p 00028000 fc:00 2232507                    /usr/lib/x86_64-linux-gnu/libgcc_s.so.1
+7ffbd7b89000-7ffbd7b8a000 r--p 0002b000 fc:00 2232507                    /usr/lib/x86_64-linux-gnu/libgcc_s.so.1
+7ffbd7b8a000-7ffbd7b8b000 rw-s 00000000 00:01 23183                      /memfd:junction_libos (deleted)
+7ffbd7b8b000-7ffbd7b9a000 r--p 00000000 fc:00 2228244                    /usr/lib/x86_64-linux-gnu/libboost_program_options.so.1.83.0
+7ffbd7b9a000-7ffbd7bbe000 r-xp 0000f000 fc:00 2228244                    /usr/lib/x86_64-linux-gnu/libboost_program_options.so.1.83.0
+7ffbd7bbe000-7ffbd7bc9000 r--p 00033000 fc:00 2228244                    /usr/lib/x86_64-linux-gnu/libboost_program_options.so.1.83.0
+7ffbd7bc9000-7ffbd7bcc000 r--p 0003d000 fc:00 2228244                    /usr/lib/x86_64-linux-gnu/libboost_program_options.so.1.83.0
+7ffbd7bcc000-7ffbd7bcd000 rw-s 00000000 00:01 23184                      /memfd:junction_libos (deleted)
+7ffbd7bcd000-7ffbd7bea000 r--p 00000000 fc:00 2229021                    /usr/lib/x86_64-linux-gnu/libnl-route-3.so.200.26.0
+7ffbd7bea000-7ffbd7c31000 r-xp 0001d000 fc:00 2229021                    /usr/lib/x86_64-linux-gnu/libnl-route-3.so.200.26.0
+7ffbd7c31000-7ffbd7c51000 r--p 00064000 fc:00 2229021                    /usr/lib/x86_64-linux-gnu/libnl-route-3.so.200.26.0
+7ffbd7c51000-7ffbd7c54000 r--p 00084000 fc:00 2229021                    /usr/lib/x86_64-linux-gnu/libnl-route-3.so.200.26.0
+7ffbd7c54000-7ffbd7c59000 rw-s 00000000 00:01 23185                      /memfd:junction_libos (deleted)
+7ffbd7c59000-7ffbd7c5c000 rw-s 00000000 00:01 23186                      /memfd:junction_libos (deleted)
+7ffbd7c5c000-7ffbd7c64000 r--p 00000000 fc:00 2229052                    /usr/lib/x86_64-linux-gnu/libnl-3.so.200.26.0
+7ffbd7c64000-7ffbd7c73000 r-xp 00008000 fc:00 2229052                    /usr/lib/x86_64-linux-gnu/libnl-3.so.200.26.0
+7ffbd7c73000-7ffbd7c7b000 r--p 00017000 fc:00 2229052                    /usr/lib/x86_64-linux-gnu/libnl-3.so.200.26.0
+7ffbd7c7b000-7ffbd7c7d000 r--p 0001e000 fc:00 2229052                    /usr/lib/x86_64-linux-gnu/libnl-3.so.200.26.0
+7ffbd7c7d000-7ffbd7c7e000 rw-s 00000000 00:01 23187                      /memfd:junction_libos (deleted)
+7ffbd7c83000-7ffbd7c93000 rw-p 00000000 00:00 0 
+7ffbd7c93000-7ffbd7c94000 rw-s 00000000 00:01 23160                      /dev/zero (deleted)
+7ffbd7c94000-7ffbd7c95000 rw-s 00000000 00:01 14366                      /dev/zero (deleted)
+7ffbd7c95000-7ffbd7c96000 rw-s 00000000 00:01 18465                      /dev/zero (deleted)
+7ffbd7c96000-7ffbd7c97000 rw-s 00000000 00:01 10274                      /dev/zero (deleted)
+7ffbd7c97000-7ffbd7c98000 rw-s 00000000 00:01 11313                      /dev/zero (deleted)
+7ffbd7c98000-7ffbd7c99000 rw-s 00000000 00:01 9249                       /dev/zero (deleted)
+7ffbd7c99000-7ffbd7c9a000 rw-s 00000000 00:01 2150                       /dev/zero (deleted)
+7ffbd7c9a000-7ffbd7c9b000 rw-s 00000000 00:01 4273                       /dev/zero (deleted)
+7ffbd7c9b000-7ffbd7c9c000 rw-s 00000000 00:01 23159                      /dev/zero (deleted)
+7ffbd7c9c000-7ffbd7c9d000 rw-s 00000000 00:01 196                        /dev/zero (deleted)
+7ffbd7c9d000-7ffbd7c9e000 r--s 00000000 00:01 1                          /SYSV696e666f (deleted)
+7ffbd7c9e000-7ffbd7ca0000 rw-s 00000000 00:01 23188                      /memfd:junction_libos (deleted)
+7ffbd7ca0000-7ffbd7ca1000 r--p 00000000 fc:00 2260002                    /usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2
+7ffbd7ca1000-7ffbd7ccc000 r-xp 00001000 fc:00 2260002                    /usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2
+7ffbd7ccc000-7ffbd7cd6000 r--p 0002c000 fc:00 2260002                    /usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2
+7ffbd7cd6000-7ffbd7cd8000 r--p 00036000 fc:00 2260002                    /usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2
+7ffbd7cd8000-7ffbd7cda000 rw-s 00000000 00:01 23189                      /memfd:junction_libos (deleted)
+7fff2abb4000-7fff2abd5000 rw-p 00000000 00:00 0                          [stack]
+7fff2abf9000-7fff2abfd000 r--p 00000000 00:00 0                          [vvar]
+7fff2abfd000-7fff2abff000 r-xp 00000000 00:00 0                          [vdso]
+ffffffffff600000-ffffffffff601000 --xp 00000000 00:00 0                  [vsyscall]

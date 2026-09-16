@@ -13,6 +13,14 @@ extern "C" {
 #include "junction/bindings/log.h"
 #include "junction/fs/fs.h"
 #include "junction/junction.h"
+extern "C" {
+#include <base/mem.h>
+}
+
+#include "junction/kernel/as.h"
+#include "junction/kernel/memtrace.h"
+#include "kern/junction_as.h"
+#include "junction/bindings/timer.h"
 #include "junction/kernel/proc.h"
 #include "junction/kernel/signal.h"
 #include "junction/shim/backend/init.h"
@@ -104,6 +112,26 @@ po::options_description GetOptions() {
        "<prefix>.elf")  //
       ("stackswitch", po::bool_switch()->default_value(false),
        "use stack switching syscalls")  //
+      ("debug_libos_escape", po::bool_switch(),
+       "probe whether a LibOS allocation can land outside an arena slot")
+      ("debug_libos_alloc", po::value<size_t>()->default_value(0),
+       "MB for the LibOS to allocate via its own glibc on the first guest "
+       "getpid(), to observe where the mapping lands (diagnostic)")  //
+      ("trace_libos_mem", po::value<std::string>()->default_value(""),
+       "trace every memory mapping operation to this file")  //
+      ("debug_hang_watchdog", po::value<size_t>()->default_value(0),
+       "dump every process and thread if no guest thread accrues runtime for "
+       "this many seconds (0 disables). For diagnosing hangs where every "
+       "kthread parks and nothing is runnable.")  //
+      ("debug_frozen_probe", po::bool_switch(),
+       "after the first fork, deliberately change LibOS memory in one address "
+       "space, to test that the frozen-invariant check notices (test only)")  //
+      ("debug_as_audit", po::bool_switch(),
+       "after every fork, check that all live address spaces agree on the "
+       "LibOS's mappings (diagnostic; costs a /proc read per address space)")  //
+      ("no_mas", po::bool_switch()->default_value(false),
+       "disable per-guest address spaces; fork() will report ENOSYS and the "
+       "LibOS keeps its memory private")  //
       ("zpoline", po::bool_switch()->default_value(false),
        "hotpatch syscall instructions using the zpoline technique")  //
       ("madv_remap", po::bool_switch()->default_value(false),
@@ -194,6 +222,27 @@ Status<void> JunctionCfg::FillFromArgs(int argc, char *argv[]) {
   mem_trace_ = vm["mem-trace"].as<bool>();
   terminate_after_snapshot_ = vm["snapshot_terminate"].as<bool>();
 
+  // Per-guest address spaces are available when the device is present, unless
+  // they have been turned off. This is decided here, before the Caladan
+  // runtime starts, because the runtime has to know whether to keep the
+  // LibOS's memory shared -- which is only worth doing if guests will ever be
+  // cloned into separate address spaces.
+  memtrace_path_ = vm["trace_libos_mem"].as<std::string>();
+  debug_libos_alloc_mb_ = vm["debug_libos_alloc"].as<size_t>();
+  debug_libos_escape_ = vm["debug_libos_escape"].as<bool>();
+  debug_as_audit_ = vm["debug_as_audit"].as<bool>();
+  debug_frozen_probe_ = vm["debug_frozen_probe"].as<bool>();
+  debug_hang_watchdog_s_ = vm["debug_hang_watchdog"].as<size_t>();
+  mas_enabled_ = !vm["no_mas"].as<bool>() &&
+                 access(JUNCTION_AS_DEVICE, R_OK | W_OK) == 0;
+  cfg_shared_runtime_mem = mas_enabled_;
+
+  // Guest processes that get their own address spaces need Junction's system
+  // call handlers to run on Junction's own stacks. Anything the LibOS leaves on
+  // a guest stack -- a Caladan timer entry for nanosleep(), say -- lives in
+  // that guest's memory, and is unreachable from any other address space.
+  if (mas_enabled_) stack_switching = true;
+
   if (mem_trace_ && !stack_switching) {
     std::cerr << "Enabling stack switching for memory tracing" << std::endl;
     stack_switching = true;
@@ -248,6 +297,54 @@ Status<void> init() {
   if (unlikely(!ret)) {
     LOG(ERR) << "failed to initialize syscall: " << ret.error();
     return ret;
+  }
+
+  // Start tracing before anything else maps memory, so the trace is complete.
+  ret = InitMemTrace(GetCfg().get_memtrace_path());
+  if (unlikely(!ret)) {
+    LOG(ERR) << "failed to open the memory trace: " << ret.error();
+    return ret;
+  }
+
+  // Must run before any guest exists: it rewrites the LibOS's own private
+  // mappings as shared ones, and it can only tell LibOS memory from guest
+  // memory while there is no guest memory.
+  ret = InitAddressSpaces();
+  if (unlikely(!ret)) {
+    LOG(ERR) << "failed to initialize address spaces: " << ret.error();
+    return ret;
+  }
+
+  // Hang watchdog. Runs as an ordinary runtime thread, which keeps being
+  // scheduled even when every guest thread is blocked -- that is exactly the
+  // state it exists to catch, and it is the one state where nothing else will
+  // ever report anything.
+  if (size_t secs = GetCfg().debug_hang_watchdog_s(); secs > 0) {
+    rt::Spawn([secs] {
+      Duration last(0);
+      size_t stuck = 0;
+      bool dumped = false;
+      while (true) {
+        rt::Sleep(Duration(1000000));  // 1 s
+        Duration total(0);
+        Process::ForEachProcess([&](Process &p) { total += p.GetRuntime(); });
+        // Guest runtime is the progress metric: it advances whenever any guest
+        // thread runs, and costs nothing to sample because the scheduler is
+        // already accounting it.
+        if (total == last) {
+          if (++stuck >= secs && !dumped) {
+            dumped = true;
+            Process::DumpAllThreads("hang watchdog: no guest runtime accrued");
+          }
+        } else {
+          stuck = 0;
+          dumped = false;
+        }
+        last = total;
+      }
+    });
+    LOG(INFO) << "watchdog: dumping all threads after " << secs
+              << "s without progress";
   }
 
   ret = InitZpoline();

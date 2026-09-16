@@ -13,6 +13,7 @@ setsid
 getpgrp
 setpgid
 arch_prctl
+fork
 vfork
 clone3
 clone
@@ -186,6 +187,7 @@ capget
 capset
 prctl
 times
+getrusage
 msync:::stub
 sched_setaffinity:::stub
 set_robust_list:::stub
