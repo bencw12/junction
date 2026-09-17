@@ -947,7 +947,20 @@ long usys_mprotect(void *addr, size_t len, int prot) {
 long usys_munmap(void *addr, size_t len) {
   MemoryMap &mm = myproc().get_mem_map();
   Status<void> ret = TracerGuardCheck(mm, [&] { return mm.MUnmap(addr, len); });
-  if (!ret) return MakeCErrorRestartSys(ret);
+  if (!ret) {
+    long r = MakeCErrorRestartSys(ret);
+    // Diagnostic: a restart code is only safe to return if the syscall exit
+    // path will run RunSignals(), which entry.S gates on interrupt_state > 0
+    // as a *signed* byte. Report what that gate will see.
+    if (r == -ERESTARTSYS) {
+      static std::atomic_int n{0};
+      if (n.fetch_add(1) < 8)
+        LOG(WARN) << "munmap -> ERESTARTSYS with interrupt_state="
+                  << static_cast<int>(atomic8_read(
+                         &mythread().GetCaladanThread()->interrupt_state));
+    }
+    return r;
+  }
   return 0;
 }
 

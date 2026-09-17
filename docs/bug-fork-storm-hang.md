@@ -293,3 +293,96 @@ caller can win. `thread_ready_prepare()` now logs `interrupt_state` and the
 three nearest return addresses before aborting, so the next occurrence names
 the second waker: reproduce with `-O -t 8 -s 2 -f 1` and resolve the addresses
 against the text anchor.
+
+
+---
+
+# Follow-up: the double ready is fork-free, pre-existing, and now deterministic
+
+The question was whether `BUG_ON(th->thread_ready)` needs the multi-address-space
+work at all. It does not, and the way to show it was not a pre-MAS build (plain
+`fork()` did not exist before this work -- `DoClone` returned `-ENOSYS` for
+anything but vfork or a thread -- so "the fork storm without MAS" is not a
+runnable configuration). It was to reproduce the failure with a workload that
+never clones an address space.
+
+`docs/traces/thread_churn_storm.c` does that: N threads each loop
+`pthread_create` / `pthread_join` of a trivial thread while a signaller sprays
+`SIGUSR1` at them. Thread exit and join drive exactly the code the fork storm
+hangs between -- `Thread::~Thread()` clearing `child_tid` and calling
+`FutexTable::Wake`, and the join's futex wait -- with `MultipleAddressSpacesExist()`
+false throughout.
+
+| workload | current build | pre-fix baseline |
+| --- | --- | --- |
+| `3 2 1` (2 churners + signals) | guest `SIGABRT`, exit 134, within 0.1 s, 3/3 | exit 134, 4/4 |
+| `3 2 1 1` (same, `SA_RESTART`) | `BUG_ON(th->thread_ready)`, 3/3 | assertion, 3/3 |
+| `3 1 1` (1 churner) | survives, but 82 threads/2 s instead of 166k | -- |
+| `3 8 0` (8 churners, no signals) | fine, 130k threads/2 s | -- |
+
+Both failures are therefore pre-existing and independent of address-space
+cloning. They are also, at last, deterministic.
+
+## The double ready: both wakers named
+
+`thread_t` now records who last made a thread runnable (`last_ready_ra`,
+`last_ready_istate`), and `thread_ready()` logs both callers on a double ready.
+Across three runs the pairs were:
+
+```
+FIRST  WaitQueue::WakeAll          SECOND  Process::SignalThread
+FIRST  Process::SignalThread       SECOND  FutexTable::Wake
+FIRST  Process::SignalThread       SECOND  Process::SignalThread     (istate 66 both times)
+```
+
+`Process::SignalThread` is the common element. It reaches `thread_ready()`
+through `SendIpi()` -> `deliver_interrupt()`, which readies whenever the prior
+`interrupt_state` is non-zero. That condition is "armed", not "armed *and
+parked*": the state was observed as `istate=66 running=1` -- a thread with a
+live arm credit that is executing on a CPU -- and as a thread already queued
+from a previous ready. `deliver_interrupt()`'s contract ("can only be called
+once") is not being upheld under a `pthread_kill` storm, and each extra call
+lands `thread_ready()` on a thread that is not parked.
+
+## The guest abort: a restart code leaks to userspace
+
+Right before `abort()` the guest's strace shows:
+
+```
+[1:3] munmap(0x4fffe9db2000, 67112960) = -512      -ERESTARTSYS
+[1:3] --- SIGUSR1 ---
+```
+
+`-512` must never reach a program. glibc's `pthread_join` frees the dead
+thread's stack and treats any `munmap` failure as fatal, silently
+(`nptl/nptl-stack.c:83`: `if (__munmap(...) != 0) abort();`).
+
+The path: `MemoryMap::MUnmap` takes `mu_` with `InterruptOrLock`;
+`SharedMutex::InterruptibleLock()` goes through `WaitInterruptibleNoRecheck()`
+when contended, which bails if an interrupt is pending; `MUnmap` returns
+`EINTR`; `usys_munmap` converts it with `MakeCErrorRestartSys` to
+`-ERESTARTSYS`, relying on the syscall-exit path to restart the call or turn it
+into `-EINTR`. It did neither. `interrupt_state` was measured as 66 at that
+point, so the `entry.S` gate (`jg` on the signed byte) does run `RunSignals()`;
+why the fix-up does not reach the returned `rax` is the open question -- the
+frame `CheckRestartSysPostHandler` writes and the frame the unwind restores are
+the place to look.
+
+## Other observations, recorded but not chased
+
+- the vfork storm (`docs/traces/vfork_signal_storm.c`) is not a hang: with the
+  watchdog on it completed, 276,899 processes in 5 s against 1.6M in 3 s on
+  another run. The waiter and main threads are being starved; whether it
+  finishes inside a timeout is luck;
+- after the guest exited with 134, `junction_run` itself sometimes stayed alive
+  until the timeout (2 of 4 baseline runs). Unexplained.
+
+## Instrumentation left in
+
+- `thread_t::last_ready_ra` / `last_ready_istate`, set in `thread_ready()` and
+  `thread_ready_head()`, printed by `thread_ready_prepare()` on a double ready.
+  Only `__builtin_return_address(0)`: deeper levels walk frame pointers `-O3`
+  does not keep, and an earlier version of this diagnostic faulted on them
+  before it could print -- which hid the very thing it was built to catch;
+- `usys_munmap` warns (at most 8 times) when it is about to hand a restart
+  code back, with the `interrupt_state` the exit gate will see.
