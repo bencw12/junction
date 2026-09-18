@@ -423,15 +423,25 @@ magnitude, not precise):
 An earlier note in this session called the churn case "deterministic, 3/3";
 that was small-sample luck. It is the same probabilistic double-ready.
 
-Root cause, traced: `interruptible_wake_test()` readies a thread unconditionally
-when `PREPARED_FLAG` is clear (`!check_prepared`). That branch is meant for
-threads that parked with plain `Wait` (no interrupt credit). But an interruptibly
-parked thread reaches it too, when its credit has been cleared out of band --
-`reset_interruptible_state()` and `set_interrupt_state_interrupted()` both
-*write* `interrupt_state` (to 0 and to 1) rather than adding to it, so a thread
-that armed with `WAKER_VAL` can have that credit clobbered. A later `WakeAll`
-then takes the unconditional path and readies a thread that another waker has
-already readied.
+Root cause: NOT yet found. What is established by measurement:
+
+- the second ready fires with `istate=0 armed=0` -- the thread is not on any
+  wait queue and holds no credit when it is readied again. So it is not a
+  `WakeAll` popping a still-armed thread;
+- the first and second readies come from different wakers (captured pairs
+  include `WaitQueue::WakeAll` + `Process::SignalThread`, and
+  `Process::SignalThread` + `FutexTable::Wake`);
+- `interruptible_wake_test()` readies unconditionally when `PREPARED_FLAG` is
+  clear, and the doubled thread has it clear -- so that branch is how the
+  second ready gets through. What is not known is why the thread is still
+  reachable by a second waker after the first ready.
+
+A hypothesis stated in an earlier version of this doc -- that
+`reset_interruptible_state()` / `set_interrupt_state_interrupted()` clobber a
+live `WAKER_VAL` credit -- was **tested and refuted**: across 30 storm runs
+(324,585 such writes) every one hit a thread with `armed=0 ready=0`, i.e. the
+normal reset of a thread that had already left its queue; none hit an armed or
+already-ready thread. That mechanism is not it.
 
 Why no point-fix was shipped -- each was measured and each only moves it:
 
@@ -451,8 +461,11 @@ storm, and its apparent churn win is within noise, so it is not shipped.
 `interruptible_park` does eliminate the assert (0/60, significant) but cannot
 tell "already readied" from "credit reset, still parked", so it drops real
 wakeups -- the assert becomes a hang. Neither is a fix; both only move the
-symptom, which is the evidence that the fix belongs at the istate-accounting
-level.
+symptom. The next diagnostic step is to capture both wakers' return addresses
+*with ASLR off* (setarch -R) on an asserting run so they resolve, and determine
+how the doubled thread remains reachable by a second waker after the first ready
+dequeued it -- that is the unknown, and no fix should be attempted before it is
+answered.
 
 The correct fix is at the accounting level: no code path may *overwrite*
 `interrupt_state` while a thread holds an arm credit; `reset`/`set-interrupted`
