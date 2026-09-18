@@ -624,16 +624,9 @@ void HandlePageFaultOnSyscallStack(KernelSignalTf &frame, int required_prot,
   // Re-enable preemption after switching off runtime stack.
   preempt_enable();
 
-  // A fault in a managed LibOS region means this address space never received
-  // a mapping the LibOS made after it was cloned. Repair it and retry the
-  // faulting instruction, which is what the unwind below does.
-  //
-  // Tried before the memory map because a managed address is never guest
-  // memory: the regions sit above kVirtualAreaMax, where no guest can be given
-  // an address, so the map has nothing to say about them.
+  // Managed LibOS regions were already tried in synchronous_signal_handler(),
+  // before anything else; a fault that reaches here is guest memory or a bug.
   bool fault_handled =
-      RepairManagedFault(reinterpret_cast<uintptr_t>(info.si_addr),
-                         required_prot) ||
       myth.get_process().get_mem_map().HandlePageFault(
           reinterpret_cast<uintptr_t>(info.si_addr), required_prot, time);
 
@@ -690,6 +683,21 @@ extern "C" void synchronous_signal_handler(int signo, siginfo_t *info,
 
   if (unlikely(!context)) print_msg_abort("signal delivered without context");
 
+  // A fault in a managed LibOS region is always the same thing -- this
+  // address space never received a mapping the LibOS made after it was
+  // cloned -- and the answer is always the same: reinstall it and retry the
+  // instruction. It can arrive from anywhere, including with no uthread
+  // running at all: the scheduler touching the stack of the thread it is
+  // about to switch to, in an address space that never saw that stack.
+  // Repair needs no Junction thread, no libc, and no bookkeeping, so it goes
+  // before every check below.
+  if (signo == SIGSEGV) {
+    auto *uc_m = k_sigframe::FromUcontext(reinterpret_cast<k_ucontext *>(context));
+    int prot = sigsegv_sigcontext_to_prot(uc_m->uc.uc_mcontext);
+    if (RepairManagedFault(reinterpret_cast<uintptr_t>(info->si_addr), prot))
+      return;
+  }
+
   if (unlikely(!thread_self()))
     print_msg_abort("Unexpected signal delivered to Caladan code");
 
@@ -726,11 +734,6 @@ extern "C" void synchronous_signal_handler(int signo, siginfo_t *info,
     // We might have segfaulted with preemption disabled in the Junction kernel.
     // Not great, but if the page fault handler can fix it, we can keep going.
     if (was_preempt_disabled) {
-      // A managed LibOS region repairs without libc and without blocking, so
-      // it is safe here -- and it has to be: the LibOS takes these faults
-      // under spinlocks, from the very allocators the arena backs.
-      if (RepairManagedFault(reinterpret_cast<uintptr_t>(info->si_addr), prot))
-        return;
       // It is only safe to enter the memory map when preemption is disabled if
       // tracing was enabled, since all MM operations are synchronized with a
       // spin lock during tracing.

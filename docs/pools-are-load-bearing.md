@@ -1,5 +1,14 @@
 # The pre-reserved pools are load-bearing, not an optimisation
 
+> **Status: the pools are gone.** Phase 3a of `docs/fork-implementation-plan.md`
+> replaced both with `runtime_mem_region` (`lib/caladan/base/mem.h`): the whole
+> index space reserved `PROT_NONE`, each slice mapped from a memfd on first use
+> at a fixed `offset = addr - base`, freed by punching with the mapping kept,
+> and repaired on fault from any address space. Everything below is the
+> measurement that showed why the pools could not simply be removed -- and why
+> the fix had to make their absence *repairable* rather than pre-reserve more.
+> The costs listed under "What the pools cost" are the ones it removes.
+
 Two branches in `lib/caladan` make the point:
 
 | branch | what it is |

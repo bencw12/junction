@@ -2,6 +2,7 @@
 
 extern "C" {
 #include <base/log.h>
+#include <base/mem.h>
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
@@ -403,8 +404,22 @@ Status<void> InitLibOSArena() {
   node_pool.base = static_cast<char *>(pool);
 
   arena.ready = true;
-  return RegisterSlot("libos-arena", arena.base, arena.len, kPageSize, fd,
-                      PROT_READ | PROT_WRITE | PROT_EXEC, true);
+  Status<void> ret = RegisterSlot("libos-arena", arena.base, arena.len,
+                                  kPageSize, fd,
+                                  PROT_READ | PROT_WRITE | PROT_EXEC, true);
+  if (!ret) return ret;
+
+  // Caladan's two runtime regions -- large pages and uthread stacks -- are
+  // index-addressed and bound 1:1 to their own memfds (base/mem.h), so a
+  // fault in either is repaired with arithmetic, like memfs.
+  for (const runtime_mem_region *r :
+       {&runtime_lgpage_region, &runtime_stack_region}) {
+    if (r->fd < 0) continue;
+    ret = RegisterSlot(r->name, r->base, r->len, r->granule, r->fd,
+                       PROT_READ | PROT_WRITE, false);
+    if (!ret) return ret;
+  }
+  return {};
 }
 
 Status<void *> ArenaMap(size_t len, int prot) {

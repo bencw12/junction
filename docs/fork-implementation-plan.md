@@ -357,8 +357,54 @@ all:
 | `[ksys_start, ksys_end)` | Junction's `ksys_mmap` and everything reaching it through the `KernelMMap*` wrappers |
 | `[base_syscall_start, base_syscall_end)` | **Caladan's own stubs** in `base/syscall.S`: `syscall_mmap`, `syscall_mprotect`, `syscall_madvise`, `syscall_mbind` |
 
-**3a. Everything in an allowlisted window must be edited.** Verified: the escape
-probe's `ksys_mmap` succeeded with no SIGSYS event.
+**3a, Caladan half: done.** The two pre-reserved pools are deleted.
+`runtime_mem_region` (`base/mem.h`, `base/mem.c`) is the replacement: each
+region -- large pages at `0x510000000000` (256 GB) and uthread stacks at
+`0x520000000000` (97 GB) -- is backed by its own sealed memfd at a **fixed
+binding**, `offset = addr - base`; the *whole* index space is reserved
+`PROT_NONE` (address space, not memory); a slice is mapped from the memfd on
+first use and its pages are punched out on free with the mapping kept. Junction
+registers both as 1:1 managed slots, so a fault in either, from any address
+space, is repaired with arithmetic, exactly like memfs.
+
+Why 1:1 and not the shadow-map arena: these allocators are index-addressed and
+reuse an address after free (`lgpage_to_addr(pg)`, `free_stacks[]`), which the
+quarantine regime forbids. But a binding that never changes is precisely the
+condition under which arithmetic repair is safe -- `stack_pos` only ever moves
+forward, and a reused page index re-maps the identical `(fd, offset)` -- so no
+rebinding ever happens and the arena's shadow map is not needed. Two regimes,
+but for the reason the memfs discussion gives: share the mechanism, not the
+store.
+
+What this deletes, against the costs listed under "the pools" below: the hard
+cliff (the limit is now `LGPAGE_META_ENTS` and `RUNTIME_MAX_THREADS`, the same
+limits the index spaces already had), the RSS high-water mark (every free
+punches), the 17 GB reserved by guesswork (`PROT_NONE | MAP_NORESERVE` costs
+nothing), and the one-address-space overflow. Stacks stay unguarded, as the
+pool's were, for the fork-cost reason given in `stack.c`; mapping only the
+usable half would give guards back at one VMA per stack.
+
+One more thing the fault path needed, found by the stack test: a fault in a
+managed region can arrive with **no uthread running** -- the scheduler itself
+touching the stack of the thread it is about to switch to, in an address space
+that never saw that stack. `synchronous_signal_handler()` aborted on
+`!thread_self()` before any repair was tried ("Unexpected signal delivered to
+Caladan code"; the test header had predicted exactly this, "no frame to report
+the fault from"). The managed repair is now the first thing the raw handler
+does, for every SIGSEGV, before any check that assumes a thread: it needs no
+Junction thread, no libc and no bookkeeping, and a managed fault always means
+the same thing whoever took it. The two later copies (Phase 1's in
+`HandlePageFaultOnSyscallStack()`, Phase 2's in the preemption-disabled branch)
+are gone; there is one place.
+
+Acceptance is the two tests that were written to crash, both now passing:
+`scripts/stack_overflow_test.sh` (fork, then 2048 parent stacks handed to the
+child; was 2/5 crashes even after the pool was replaced, until the handler
+change above) and `scripts/pipe_heap_test.sh` (17000 pipes past the old pool;
+was 3/3 crashes).
+
+**3a, Junction half: open.** Everything in an allowlisted window must be edited.
+Verified: the escape probe's `ksys_mmap` succeeded with no SIGSYS event.
 
 - Junction: `mm.cc` (5), `memfs.cc` (3), `jif.cc` (2), `perf.h`,
   `linuxfile.cc`, `zpoline.cc`, `syscall.cc`, `shim/backend/init.cc` — plus
