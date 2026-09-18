@@ -520,6 +520,25 @@ size_t ForEachOtherAddressSpace(void (*fn)(uint64_t, void *), void *ctx) {
   return visited;
 }
 
+int RangeReadableHere(uintptr_t start, uintptr_t end) {
+  if (!maps_ref) return -1;
+  Status<size_t> n = SnapshotMaps(maps_ref);
+  if (!n) return -1;
+  // Readable means covered, with PROT_READ, everywhere in the range. The
+  // arena's reservation is PROT_NONE and reads as prot 0, so it does not
+  // count; a repaired range does.
+  uintptr_t cur = start;
+  for (size_t i = 0; i < *n; i++) {
+    const Mapping &m = maps_ref[i];
+    if (m.end <= cur) continue;
+    if (m.start > cur) return 0;
+    if (!(m.prot & PROT_READ)) return 0;
+    cur = m.end;
+    if (cur >= end) return 1;
+  }
+  return 0;
+}
+
 size_t AuditAddressSpaceCoherence(bool log_details) {
   if (!MultipleAddressSpacesExist() || !maps_other) return 0;
 

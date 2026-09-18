@@ -69,6 +69,12 @@ echo "------------------------------------------------------------"
 want "probe: cross-address-space read-back repaired" \
      "arena probe: PASS" \
      ./junction_run "${CFG}" --debug_arena_probe -- "${ONE_FORK[@]}"
+# Verified from the other address space's own /proc map, not inferred from
+# the fault count: the ranges are covered only by the PROT_NONE reservation
+# before the touch, and by the repaired mapping after it.
+want "probe: ranges verified absent in the child before touch" \
+     "absent in each other address space before touch, present after" \
+     ./junction_run "${CFG}" --debug_arena_probe -- "${ONE_FORK[@]}"
 reject "probe: no fatal fault on the preempt-disabled path" \
        "fault with preemption disabled|unhandled segfault|segfault in syscall" \
        ./junction_run "${CFG}" --debug_arena_probe -- "${ONE_FORK[@]}"

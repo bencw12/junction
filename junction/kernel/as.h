@@ -125,4 +125,13 @@ size_t AuditAddressSpaceCoherence(bool log_details = true);
 size_t ForEachOtherAddressSpace(void (*fn)(uint64_t handle, void *ctx),
                                 void *ctx);
 
+// In the calling kthread's *current* address space, whether every byte of
+// [start, end) is covered by a readable mapping: 1 if so, 0 if not (a gap, or
+// only the PROT_NONE reservation), -1 if the map could not be read. For tests
+// that must know a range is genuinely absent before touching it, rather than
+// inferring it from a fault count. Raw syscalls only, so safe with preemption
+// disabled; uses the audit's scratch, so it may only be called from inside a
+// ForEachOtherAddressSpace() visit, which holds that scratch's lock.
+[[nodiscard]] int RangeReadableHere(uintptr_t start, uintptr_t end);
+
 }  // namespace junction

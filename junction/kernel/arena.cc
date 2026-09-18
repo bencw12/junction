@@ -562,20 +562,35 @@ struct ProbeVisit {
   size_t n;
   size_t mismatches;
   size_t visited;
+  size_t present_before;  // a range was already readable there: test invalid
+  size_t absent_after;    // a range was not readable after its repair
+  size_t map_unreadable;  // /proc could not be read; nothing was verified
 };
 
 // Runs in another address space with preemption disabled: no LOG, no
-// allocation. Each first touch of a range faults, and the fault is repaired
-// through the preemption-disabled path in the signal handler -- the same one
-// the LibOS's own allocators take under their spinlocks.
+// allocation. Before touching anything it checks, from that address space's
+// own /proc map, that each range is genuinely absent -- covered only by the
+// PROT_NONE reservation -- so the faults below are known to be real rather
+// than inferred from a count. Each first touch then faults, and the fault is
+// repaired through the preemption-disabled path in the signal handler -- the
+// same one the LibOS's own allocators take under their spinlocks. Afterwards
+// the map is read again: the repair must have installed the range.
 void ProbeReadBack(uint64_t, void *ctx) {
   ProbeVisit &v = *static_cast<ProbeVisit *>(ctx);
   v.visited++;
   for (size_t i = 0; i < v.n; i++) {
+    uintptr_t s = reinterpret_cast<uintptr_t>(v.ranges[i].p);
+    uintptr_t e = s + v.ranges[i].len;
+    int before = RangeReadableHere(s, e);
+    if (before < 0) v.map_unreadable++;
+    if (before > 0) v.present_before++;
+
     const volatile unsigned char *b =
         static_cast<const volatile unsigned char *>(v.ranges[i].p);
     if (b[0] != v.ranges[i].byte || b[v.ranges[i].len - 1] != v.ranges[i].byte)
       v.mismatches++;
+
+    if (RangeReadableHere(s, e) != 1) v.absent_after++;
   }
 }
 
@@ -645,13 +660,29 @@ void ArenaProbe() {
   // ranges. Reading them there faults and must be repaired from the shadow
   // map -- including the read-only one, whose repair must install PROT_READ.
   uint64_t before = ManagedFaultCount();
-  ProbeVisit visit{r, 4, 0, 0};
+  ProbeVisit visit{r, 4, 0, 0, 0, 0, 0};
   size_t visited = ForEachOtherAddressSpace(ProbeReadBack, &visit);
   uint64_t repaired = ManagedFaultCount() - before;
 
   ArenaStats st = GetArenaStats();
   if (visited == 0) {
     LOG(WARN) << "arena probe: FAIL: no other address space to visit";
+    return;
+  }
+  if (visit.map_unreadable) {
+    LOG(WARN) << "arena probe: FAIL: could not read /proc maps in "
+              << visit.map_unreadable << " visit(s); absence not verified";
+    return;
+  }
+  if (visit.present_before) {
+    LOG(WARN) << "arena probe: FAIL: " << visit.present_before
+              << " range(s) were already mapped in another address space "
+                 "before being touched -- the faults would not have been real";
+    return;
+  }
+  if (visit.absent_after) {
+    LOG(WARN) << "arena probe: FAIL: " << visit.absent_after
+              << " range(s) not readable after their repair";
     return;
   }
   if (visit.mismatches) {
@@ -667,8 +698,10 @@ void ArenaProbe() {
               << " repairs, saw " << repaired;
     return;
   }
-  LOG(INFO) << "arena probe: PASS: " << repaired << " fault(s) repaired across "
-            << visited << " other address space(s); " << st.live_entries
+  LOG(INFO) << "arena probe: PASS: 4 range(s) absent in each other address "
+               "space before touch, present after; "
+            << repaired << " fault(s) repaired across " << visited
+            << " other address space(s); " << st.live_entries
             << " live, " << st.dead_entries << " quarantined, "
             << st.nodes_in_use << "/" << st.nodes_capacity << " nodes";
 }

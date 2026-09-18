@@ -215,9 +215,11 @@ shadow-map repair path inside `RepairManagedFault()`. The slot is at
 `0x530000000000` as planned, 512 GB, sealed memfd, `PROT_NONE` reservation.
 Verified by `--debug_arena_probe`: after the first fork it maps four ranges of
 different shapes, changes one's protection, frees one, and reads all four back
-from every other address space -- 4 faults repaired per address space visited,
-the read-only one reinstalled as read-only, the freed one quarantined and not
-reused. Three things the plan below did not anticipate, all now in:
+from every other address space -- each range verified, from that address
+space's own `/proc` map, to be covered only by the `PROT_NONE` reservation
+before the touch and by the repaired memfd mapping after it; 4 faults repaired
+per address space visited, the read-only one reinstalled as read-only, the
+freed one quarantined and not reused. Three things the plan below did not anticipate, all now in:
 
 - **The preemption-disabled fault path never tried a managed repair.**
   `signal.cc` only consulted the guest memory map there, and only under
