@@ -462,6 +462,40 @@ making `deliver_interrupt` (or the WaitQueue arm) keep the queue membership and
 the readiness in agreement, so a thread is never both `thread_ready` and
 poppable by another waker.
 
+## Point-fixes: all rejected, with sample sizes this time
+
+Every fix attempted has now been measured at 40-60 runs. None reliably fixes
+the double-ready, and the committed state (munmap + the hang fix) is the best
+available:
+
+| variant | fork-storm hang | fork-storm assert | notes |
+| --- | --- | --- | --- |
+| committed (munmap + idempotent arm) | 0 / 60 | ~8 / 60 | best available |
+| deliver_interrupt readies only on WAKER_VAL | 0 / 60 | ~6 / 60 | within noise of committed; not a fix |
+| interruptible_park sticky bit | **9 / 60** | 4 / 60 | worst; and logged `SUPPRESS but not ready` twice, proving it drops real wakeups |
+| hot-path lock removal | introduced hangs | -- | rejected earlier |
+
+An earlier revision reported `interruptible_park` as "0 asserts, 7 hangs" and
+treated it as promising. That was a small sample. At 60 runs it asserts *and*
+hangs *and* drops wakeups -- it is strictly the worst option. The lesson, again:
+these rates need 40+ runs; anything smaller has misled every time in this
+investigation.
+
+## The fix this actually needs
+
+The proven mechanism is that `deliver_interrupt()` readies a thread while it is
+still linked on a bindings-layer `WaitQueue`, and `interruptible_wake()`'s
+flag-clear branch then readies it a second time. A correct fix has to make the
+interrupt-wake path and the `WaitQueue` agree: the thread must be removed from
+its `WaitQueue` at the moment it is readied by *any* path, not only by the
+`WaitQueue`'s own `Wake*`. That means plumbing the queue identity (or a
+removal callback) down to `deliver_interrupt`, which sits in Caladan and today
+cannot see the bindings-layer queue -- a cross-layer change that should be
+designed and reviewed, not bolted on. A generation counter on `interrupt_state`
+(so a stale wake from a prior arm cycle cannot ready a re-armed thread) is the
+other candidate. Neither is a one-liner, and the point-fix table above is the
+evidence that a one-liner does not exist here.
+
 A hypothesis from an earlier revision -- that `reset_interruptible_state()` /
 `set_interrupt_state_interrupted()` clobber a live `WAKER_VAL` credit -- was
 tested (log every such write landing on a thread with `PREPARED_FLAG` set) and
