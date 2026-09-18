@@ -13,6 +13,7 @@
 #include "junction/bindings/log.h"
 #include "junction/bindings/sync.h"
 #include "junction/fs/file.h"
+#include "junction/kernel/arena.h"
 #include "junction/kernel/ksys.h"
 #include "junction/snapshot/cereal.h"
 
@@ -161,6 +162,10 @@ class alignas(kCacheLineSize) MemoryMap {
   // Creates the memory map of a forked child: the same mappings at the same
   // addresses, but in an address space of its own. The caller supplies the
   // address space, which this object takes ownership of.
+  // The arena's GC cursor for this address space (arena.h). Read on every
+  // syscall entry, so it is a cached pointer into the arena's slot table.
+  [[nodiscard]] uint64_t *arena_gc_cursor() const { return arena_gc_cursor_; }
+
   static std::shared_ptr<MemoryMap> Fork(MemoryMap &parent,
                                          uint64_t as_handle);
 
@@ -178,6 +183,7 @@ class alignas(kCacheLineSize) MemoryMap {
   // the global region map (MM Panic).
   void TransferAddressSpaceTo(MemoryMap &other) {
     other.as_handle_ = as_handle_;
+    other.arena_gc_cursor_ = arena_gc_cursor_;
     other.owns_as_ = owns_as_;
     as_transferred_ = true;
     owns_as_ = false;
@@ -395,6 +401,7 @@ class alignas(kCacheLineSize) MemoryMap {
   // The address space these mappings live in. Guest processes that have never
   // forked share the address space Junction started in.
   uint64_t as_handle_{kRootAddressSpace};
+  uint64_t *arena_gc_cursor_{nullptr};
   // Whether destroying this memory map should release the address space. The
   // root address space is never released, and exec() transfers ownership to
   // the replacement memory map.

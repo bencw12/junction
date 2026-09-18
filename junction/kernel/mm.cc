@@ -22,6 +22,7 @@ extern "C" {
 #include "junction/fs/file.h"
 #include "junction/kernel/as.h"
 #include "junction/kernel/memtrace.h"
+#include "junction/kernel/arena.h"
 #include "junction/kernel/mm.h"
 #include "junction/kernel/proc.h"
 #include "junction/kernel/usys.h"
@@ -180,6 +181,9 @@ std::shared_ptr<MemoryMap> MemoryMap::Fork(MemoryMap &parent,
       reinterpret_cast<void *>(parent.mm_start_),
       parent.mm_end_ - parent.mm_start_);
   mm->as_handle_ = as_handle;
+  // The slot was created with the address space (CloneCurrentAddressSpace);
+  // this is a lookup. Seeding 0 if it were somehow missing is the safe side.
+  mm->arena_gc_cursor_ = ArenaGcSlot(as_handle, 0);
   mm->owns_as_ = true;
   mm->shares_reservation_ = true;
   mm->brk_addr_ = parent.brk_addr_;
@@ -218,7 +222,9 @@ Status<std::shared_ptr<MemoryMap>> MemoryMap::Create(size_t len) {
     rt::SpinGuard g(mm_lock_);
     AcquireRegionRef(*base);
   }
-  return std::make_shared<MemoryMap>(*ret, len);
+  auto mm = std::make_shared<MemoryMap>(*ret, len);
+  mm->arena_gc_cursor_ = ArenaGcSlot(mm->as_handle_, 0);
+  return mm;
 }
 
 void MemoryMap::MunmapCheck(void *addr, size_t len) {

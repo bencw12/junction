@@ -117,9 +117,52 @@ Status<void *> ArenaRemap(void *old, size_t old_len, size_t new_len,
 [[nodiscard]] bool ArenaContains(uintptr_t addr);
 [[nodiscard]] bool ArenaIsLive(uintptr_t addr);
 
+// --- Garbage collection (Phase 5): retiring quarantined ranges ---
+//
+// A freed range cannot be reused until every address space that materialised
+// it has dropped its mapping, and nothing tells those address spaces on its
+// own. So freeing appends a tombstone to a log, every address space carries a
+// cursor into that log, an address space applies the tombstones past its
+// cursor when it next enters the kernel (batch-limited, in the mm that needs
+// it, while it is loaded), and a range leaves quarantine when the smallest
+// cursor over all live address spaces has passed it. An address space that
+// never enters the kernel pins the epoch; under pressure the collector visits
+// it and applies on its behalf.
+//
+// The property that makes this forgiving: applying a tombstone means putting
+// the reservation back over the range, and applying one that no longer needs
+// applying -- or applying the same one twice -- only creates an absence that
+// the fault handler repairs. So a cursor need only ever be *at most* the
+// truth, never exact.
+
+// The cursor slot for an address space, created on first use. A MemoryMap
+// caches the pointer so the per-syscall check is two loads. @inherited seeds
+// a new slot: a clone starts where its parent was *before* the clone.
+[[nodiscard]] uint64_t *ArenaGcSlot(uint64_t as_handle, uint64_t inherited);
+// The cursor of an address space's slot, 0 if it has none. For seeding a
+// clone: read *before* the clone, so the child starts at or behind the truth.
+[[nodiscard]] uint64_t ArenaGcCursorOf(uint64_t as_handle);
+// Drops the slot when the address space is released, so it stops pinning.
+void ArenaGcForget(uint64_t as_handle);
+
+// Does the address space behind @cursor have tombstones to apply?
+[[nodiscard]] bool ArenaGcPending(const uint64_t *cursor);
+// Applies one batch of pending tombstones to the *current* address space and
+// advances *cursor. The caller must be bound to that address space.
+void ArenaGcApply(uint64_t *cursor);
+
+// One collection: releases every tombstone all live address spaces have
+// applied; under pressure, or when @force, visits the stragglers first.
+void ArenaGcCollect(bool force);
+// Starts the collector thread.
+void StartArenaGc();
+
 struct ArenaStats {
   size_t mapped_bytes;       // live
   size_t quarantined_bytes;  // freed, awaiting GC
+  size_t released_bytes;     // left quarantine so far
+  size_t tombstones_pending; // in the log, not yet released
+  size_t gc_walks;           // pressure-triggered straggler visits
   size_t live_entries;       // shadow-map entries, live
   size_t dead_entries;       // shadow-map entries, quarantined
   size_t nodes_in_use;       // of the node pool

@@ -350,6 +350,7 @@ bool TryActivateAddressSpace(uint64_t handle) {
 void ReleaseAddressSpace(uint64_t handle) {
   if (handle == kRootAddressSpace) return;
   UnregisterAddressSpace(handle);
+  ArenaGcForget(handle);  // so a dead address space stops pinning the epoch
   long ret = ksyscall(__NR_ioctl, as_dev_fd, JUNCTION_AS_RELEASE, handle);
   if (unlikely(ret < 0))
     LOG(ERR) << "as: failed to release address space " << handle << ": "
@@ -366,6 +367,14 @@ Status<uint64_t> CloneCurrentAddressSpace(
     const std::vector<AddressRange> &exclude) {
   assert(fork_lock.IsHeld());
   if (unlikely(!MultiAddressSpaceEnabled())) return MakeError(ENOSYS);
+
+  // The clone inherits this address space's stale arena mappings as of the
+  // clone, so it must apply tombstones from where we are *now* -- read before
+  // the clone, since another thread may advance our cursor meanwhile (earlier
+  // than the truth is safe; later is not). And its slot must exist from the
+  // moment the address space does, below, or a collection in the window
+  // before its MemoryMap is built would not count it.
+  uint64_t inherited_gc_cursor = ArenaGcCursorOf(GetActiveAddressSpace());
 
   // Keep the excluded ranges out of the clone. MADV_DONTFORK is a per-VMA
   // flag, so this has to be undone afterwards or the ranges would vanish from
@@ -426,6 +435,7 @@ Status<uint64_t> CloneCurrentAddressSpace(
   if (ret < 0) return MakeError(-ret);
   multiple_as.store(true, std::memory_order_relaxed);
   RegisterAddressSpace(arg.handle);
+  (void)ArenaGcSlot(arg.handle, inherited_gc_cursor);
   return static_cast<uint64_t>(arg.handle);
 }
 

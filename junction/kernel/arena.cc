@@ -21,6 +21,8 @@ extern "C" {
 #include "junction/kernel/as.h"
 #include "junction/kernel/ksys.h"
 #include "junction/kernel/mm.h"
+#include "junction/bindings/timer.h"
+#include "junction/bindings/thread.h"
 
 #ifndef MFD_EXEC
 #define MFD_EXEC 0x0010U
@@ -230,7 +232,37 @@ struct Arena {
   size_t mapped{0};
   size_t quarantined{0};
   size_t punch_failures{0};
+
+  // The tombstone log: a ring, indexed by a monotonic sequence number.
+  // Entries in [tail, head) are quarantined and not yet released.
+  struct Tombstone {
+    uintptr_t start, end;
+    uint64_t off;
+    bool free_offsets;  // false if mremap moved the range: offsets live on
+  };
+  static constexpr size_t kLogSize = 65536;
+  Tombstone log[kLogSize];
+  uint64_t head{0};
+  uint64_t tail{0};
+  size_t leaked{0};  // frees the log could not record: quarantined for good
+
+  // One cursor per address space. Slot 0 is the root's.
+  struct GcSlot {
+    uint64_t handle;
+    uint64_t cursor;
+    bool live;
+  };
+  static constexpr size_t kMaxSlots = 1025;
+  GcSlot gc[kMaxSlots];
+  size_t nr_gc{0};
+
+  size_t released{0};
+  size_t walks{0};
 } arena;
+
+constexpr size_t kGcBatch = 64;              // tombstones per apply
+constexpr size_t kGcPressureBytes = 256UL << 20;
+constexpr uint64_t kGcPeriodUs = 50000;      // collector wakes every 50 ms
 
 // The arena's slot: 512 GB at 0x530000000000, the next free 512 GB-aligned
 // slot above Caladan's relocated page pool (0x510000000000) and stack pool
@@ -278,6 +310,23 @@ size_t PunchLocked(uintptr_t start, uintptr_t end) {
 // the range is live. Returns punch failures.
 size_t UnmapLocked(uintptr_t start, uintptr_t end, bool punch, bool moved) {
   size_t failed = punch ? PunchLocked(start, end) : 0;
+
+  // One tombstone per piece, so release knows each piece's offsets. If the
+  // log is full the range stays quarantined for good: a leak of address
+  // space, counted, rather than a reuse that is not yet safe.
+  for (uintptr_t cur = start; cur < end;) {
+    const ShadowEntry &e = arena.va.Find(cur)->get();
+    uintptr_t piece_end = std::min(e.end_, end);
+    if (arena.head - arena.tail < Arena::kLogSize) {
+      arena.log[arena.head % Arena::kLogSize] =
+          Arena::Tombstone{cur, piece_end, e.offset_ + (cur - e.start_), !moved};
+      arena.head++;
+    } else {
+      arena.leaked += piece_end - cur;
+    }
+    cur = piece_end;
+  }
+
   arena.va.Modify(
       start, end, [](const ShadowEntry &e) { return !e.dead_; },
       [moved](ShadowEntry &e) {
@@ -446,6 +495,8 @@ Status<void> InitLibOSArena() {
   if (pool == MAP_FAILED) return MakeError(ENOMEM);
   node_pool.base = static_cast<char *>(pool);
 
+  arena.gc[0] = Arena::GcSlot{kRootAddressSpace, 0, true};
+  arena.nr_gc = 1;
   arena.ready = true;
   Status<void> ret = RegisterSlot("libos-arena", arena.base, arena.len,
                                   kPageSize, fd,
@@ -747,6 +798,142 @@ bool RouteLibOSMemSyscall(long sysn, long a0, long a1, long a2, long a3,
   }
 }
 
+// ---------------------------------------------------------------------------
+// Garbage collection.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+Arena::GcSlot *FindGcSlot(uint64_t handle) {
+  for (size_t i = 0; i < arena.nr_gc; i++)
+    if (arena.gc[i].live && arena.gc[i].handle == handle) return &arena.gc[i];
+  return nullptr;
+}
+
+// Applies up to one batch to the current address space. Caller holds the
+// lock and is bound to the address space @cursor belongs to. Returns whether
+// anything remains.
+bool ApplyLocked(uint64_t *cursor) {
+  uint64_t c = std::max(*cursor, arena.tail);
+  uint64_t stop = std::min(arena.head, c + kGcBatch);
+  for (; c < stop; c++) {
+    const Arena::Tombstone &t = arena.log[c % Arena::kLogSize];
+    // The reservation back over the range, in this address space. Idempotent,
+    // and harmless if this address space never had the range.
+    ksys_mmap(reinterpret_cast<void *>(t.start), t.end - t.start, PROT_NONE,
+              MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED, -1, 0);
+  }
+  *cursor = c;
+  return c < arena.head;
+}
+
+// Releases every tombstone below the smallest live cursor. Caller holds the
+// lock.
+void ReleaseLocked() {
+  uint64_t min = arena.head;
+  for (size_t i = 0; i < arena.nr_gc; i++)
+    if (arena.gc[i].live) min = std::min(min, arena.gc[i].cursor);
+  while (arena.tail < min) {
+    const Arena::Tombstone &t = arena.log[arena.tail % Arena::kLogSize];
+    arena.va.Clear(t.start, t.end);
+    if (t.free_offsets) arena.off.Clear(t.off, t.off + (t.end - t.start));
+    arena.quarantined -= t.end - t.start;
+    arena.released += t.end - t.start;
+    arena.tail++;
+  }
+}
+
+}  // namespace
+
+uint64_t *ArenaGcSlot(uint64_t handle, uint64_t inherited) {
+  rt::SpinGuard g(arena.lock);
+  if (Arena::GcSlot *s = FindGcSlot(handle)) return &s->cursor;
+  for (size_t i = 0; i < arena.nr_gc; i++) {
+    if (arena.gc[i].live) continue;
+    arena.gc[i] = Arena::GcSlot{handle, inherited, true};
+    return &arena.gc[i].cursor;
+  }
+  BUG_ON(arena.nr_gc == Arena::kMaxSlots);
+  arena.gc[arena.nr_gc] = Arena::GcSlot{handle, inherited, true};
+  return &arena.gc[arena.nr_gc++].cursor;
+}
+
+uint64_t ArenaGcCursorOf(uint64_t handle) {
+  rt::SpinGuard g(arena.lock);
+  Arena::GcSlot *s = FindGcSlot(handle);
+  return s ? s->cursor : 0;
+}
+
+void ArenaGcForget(uint64_t handle) {
+  rt::SpinGuard g(arena.lock);
+  if (Arena::GcSlot *s = FindGcSlot(handle)) s->live = false;
+}
+
+bool ArenaGcPending(const uint64_t *cursor) {
+  return cursor && *cursor < arena.head;  // both plain loads; racy is fine
+}
+
+void ArenaGcApply(uint64_t *cursor) {
+  rt::SpinGuard g(arena.lock);
+  ApplyLocked(cursor);
+}
+
+void ArenaGcCollect(bool force) {
+  if (!arena.ready) return;
+
+  // Stragglers, under pressure: address spaces whose cursor is behind. Visit
+  // each, apply on its behalf, come back. The list is taken under the lock;
+  // the visits are not, because binding and the syscalls inside should not
+  // hold a spinlock for long.
+  struct Visit {
+    uint64_t handle;
+    uint64_t *cursor;
+  };
+  static Visit visits[Arena::kMaxSlots];
+  size_t n = 0;
+  {
+    rt::SpinGuard g(arena.lock);
+    ReleaseLocked();
+    bool pressure = arena.head - arena.tail > Arena::kLogSize / 2 ||
+                    arena.quarantined > kGcPressureBytes;
+    if (force || pressure)
+      for (size_t i = 0; i < arena.nr_gc; i++)
+        if (arena.gc[i].live && arena.gc[i].cursor < arena.head)
+          visits[n++] = Visit{arena.gc[i].handle, &arena.gc[i].cursor};
+  }
+  if (!n) return;
+
+  const uint64_t home = GetActiveAddressSpace();
+  for (size_t i = 0; i < n; i++) {
+    // Preemption off across the visit: on_sched() would rebind the core.
+    rt::Preempt preempt;
+    rt::PreemptGuard nopreempt(preempt);
+    bool bound = visits[i].handle == home
+                     ? true
+                     : TryActivateAddressSpace(visits[i].handle);
+    if (!bound) continue;  // released meanwhile; its slot is gone too
+    {
+      rt::SpinGuard g(arena.lock);
+      while (ApplyLocked(visits[i].cursor)) {
+      }
+      arena.walks++;
+    }
+    if (visits[i].handle != home) ActivateAddressSpace(home);
+  }
+  rt::SpinGuard g(arena.lock);
+  ReleaseLocked();
+}
+
+void StartArenaGc() {
+  if (!arena.ready) return;
+  rt::Spawn([] {
+    while (true) {
+      rt::Sleep(Duration(kGcPeriodUs));
+      ArenaGcCollect(false);
+    }
+  });
+}
+
 bool ArenaContains(uintptr_t addr) {
   return arena.ready && addr >= arena.base && addr < arena.base + arena.len;
 }
@@ -770,6 +957,9 @@ ArenaStats GetArenaStats() {
     else
       st.live_entries++;
   }
+  st.released_bytes = arena.released;
+  st.tombstones_pending = arena.head - arena.tail;
+  st.gc_walks = arena.walks;
   st.nodes_in_use = node_pool.in_use;
   st.nodes_capacity = kNodeCapacity;
   st.punch_failures = arena.punch_failures;
@@ -929,8 +1119,70 @@ void ArenaProbe() {
               << " repairs, saw " << repaired;
     return;
   }
+  // Retirement. Free a range every other address space has materialised,
+  // collect (which visits them), and check three things: the range is no
+  // longer readable there, nothing is left in quarantine, and the entries are
+  // gone. Then churn: map and free many ranges, collect, and check that the
+  // arena is back where it started -- address space reused, nothing leaked.
+  size_t nodes_before = GetArenaStats().nodes_in_use;
+  if (Status<void> ret = ArenaUnmap(r[0].p, r[0].len); !ret) {
+    LOG(WARN) << "arena probe: FAIL: ArenaUnmap for GC failed: " << ret.error();
+    return;
+  }
+  ArenaGcCollect(/*force=*/true);
+  ArenaStats after = GetArenaStats();
+  struct Retired {
+    uintptr_t s, e;
+    size_t still_readable;
+  } retired{reinterpret_cast<uintptr_t>(r[0].p),
+            reinterpret_cast<uintptr_t>(r[0].p) + r[0].len, 0};
+  ForEachOtherAddressSpace(
+      [](uint64_t, void *ctx) {
+        Retired &rt = *static_cast<Retired *>(ctx);
+        if (RangeReadableHere(rt.s, rt.e) != 0) rt.still_readable++;
+      },
+      &retired);
+  if (retired.still_readable) {
+    LOG(WARN) << "arena probe: FAIL: freed range still readable in "
+              << retired.still_readable << " other address space(s) after GC";
+    return;
+  }
+  if (after.quarantined_bytes || after.tombstones_pending) {
+    LOG(WARN) << "arena probe: FAIL: after GC " << after.quarantined_bytes
+              << " bytes / " << after.tombstones_pending
+              << " tombstone(s) still quarantined";
+    return;
+  }
+  constexpr size_t kChurn = 256, kChurnLen = 1UL << 20;
+  for (size_t i = 0; i < kChurn; i++) {
+    Status<void *> p = ArenaMap(kChurnLen, PROT_READ | PROT_WRITE);
+    if (!p) {
+      LOG(WARN) << "arena probe: FAIL: churn map " << i << ": " << p.error();
+      return;
+    }
+    static_cast<unsigned char *>(*p)[0] = 1;
+    if (Status<void> ret = ArenaUnmap(*p, kChurnLen); !ret) {
+      LOG(WARN) << "arena probe: FAIL: churn unmap " << i << ": " << ret.error();
+      return;
+    }
+  }
+  ArenaGcCollect(/*force=*/true);
+  ArenaStats churned = GetArenaStats();
+  if (churned.quarantined_bytes || churned.tombstones_pending ||
+      churned.nodes_in_use > nodes_before) {
+    LOG(WARN) << "arena probe: FAIL: after churn " << churned.quarantined_bytes
+              << " bytes quarantined, " << churned.tombstones_pending
+              << " tombstones, " << churned.nodes_in_use << " nodes (was "
+              << nodes_before << ")";
+    return;
+  }
+  st = churned;
+
   LOG(INFO) << "arena probe: PASS: 4 range(s) absent in each other address "
-               "space before touch, present after; "
+               "space before touch, present after; freed range retired "
+               "everywhere by GC; "
+            << kChurn << " map/free cycles reused, "
+            << (st.released_bytes >> 20) << " MB released; "
             << repaired << " fault(s) repaired across " << visited
             << " other address space(s); " << st.live_entries
             << " live, " << st.dead_entries << " quarantined, "

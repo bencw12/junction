@@ -1,4 +1,5 @@
 
+#include "junction/kernel/arena.h"
 #include "junction/kernel/proc.h"
 #include "junction/syscall/syscall.h"
 
@@ -86,7 +87,14 @@ unsigned long sys_dispatch(long arg0, long arg1, long arg2, long arg3,
 
   // Recorded so Process::DumpAllThreads() can say what a blocked thread is
   // blocked *in*. One store per system call.
-  if (likely(IsJunctionThread())) mythread().set_cur_syscall(syscall);
+  if (likely(IsJunctionThread())) {
+    Thread &t = mythread();
+    t.set_cur_syscall(syscall);
+    // Arena GC: retire quarantined ranges in this address space, while it is
+    // loaded and we are somewhere safe. Two loads on the common path.
+    uint64_t *cursor = t.get_process().get_mem_map().arena_gc_cursor();
+    if (unlikely(ArenaGcPending(cursor))) ArenaGcApply(cursor);
+  }
 
   return sys_tbl[syscall](arg0, arg1, arg2, arg3, arg4, arg5);
 }

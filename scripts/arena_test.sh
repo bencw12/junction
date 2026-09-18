@@ -99,6 +99,17 @@ reject "audit does not report arena absences as divergence" \
 
 echo
 echo "------------------------------------------------------------"
+echo "5: GC retires freed ranges everywhere and reuses their address space"
+echo "------------------------------------------------------------"
+want "probe: freed range retired in the other address space by GC" \
+     "freed range retired everywhere by GC" \
+     ./junction_run "${CFG}" --debug_arena_probe -- "${ONE_FORK[@]}"
+want "probe: 256 map/free cycles leave nothing quarantined" \
+     "256 map/free cycles reused" \
+     ./junction_run "${CFG}" --debug_arena_probe -- "${ONE_FORK[@]}"
+
+echo
+echo "------------------------------------------------------------"
 echo "nothing else regressed"
 echo "------------------------------------------------------------"
 want "shell pipeline across a fork still works" "hi" \

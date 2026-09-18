@@ -592,6 +592,53 @@ skipped by the audit silently.
 
 ## Phase 5 — GC by epoch, applied where it is cheap
 
+**Status: done.** `arena.cc`, "Garbage collection". The shape below, with these
+specifics:
+
+- **The tombstone log** is a 65536-entry ring under the arena lock, one entry
+  per *piece* of a freed range (so release knows each piece's offsets) with a
+  `free_offsets` flag that is false for a range `mremap` moved away, since its
+  offsets live on at the new address. A full log leaks the range into
+  quarantine for good, counted, rather than reusing it early.
+- **One cursor per address space**, in a slot table in the arena; the root has
+  slot 0. A `MemoryMap` caches a pointer to its address space's slot, so the
+  per-syscall check in `sys_dispatch()` is two loads, `*cursor < head`.
+- **Apply at syscall entry**, one batch of 64 per entry, in the address space
+  that needs it while it is loaded. No `on_sched` change was needed: a thread
+  that never enters the kernel is a straggler, and the collector covers it.
+- **Applying means the reservation back over the range**, `MAP_FIXED
+  PROT_NONE`, not `munmap` -- the same single syscall, and it keeps the slot
+  whole, which is why the reservation is kept at all. This supersedes point 4
+  below.
+- **The collector** is a runtime thread, every 50 ms: release everything below
+  `min(cursor)` over live slots (erase the dead entries; free the offsets if
+  they are this range's), and under pressure -- half the log, or 256 MB
+  quarantined -- visit each straggler with preemption disabled, apply on its
+  behalf, and release again. `ArenaGcCollect(force)` runs one collection on
+  demand for tests.
+- **A clone's slot is created inside `CloneCurrentAddressSpace()`**, seeded
+  with the cloner's cursor read *before* the clone. Both halves matter and the
+  probe found the first: the address space exists from the clone, and a
+  collection in the window before its `MemoryMap` is built must count it, or
+  it is left out of `min(cursor)` while holding stale mappings. Reading the
+  seed before the clone keeps the child at or behind the truth.
+
+The property that makes the whole thing forgiving, and worth stating once:
+**over-applying is harmless.** Putting the reservation over a range that is
+live, or twice, only creates an absence, and the fault handler repairs
+absences. So a cursor need only ever be *at most* the truth -- a new
+`MemoryMap` with no better information starts at 0 and re-applies the retained
+log once. Exactness is only needed in one direction.
+
+Verified by `--debug_arena_probe` (`scripts/arena_test.sh`, 11/11): a range
+every other address space has materialised is freed and collected, and is then
+not readable there (checked from that address space's own map), nothing is
+left in quarantine, and the entries are gone; then 256 map/free cycles of 1 MB
+leave nothing quarantined, 256 MB released, and the node count back at its
+baseline -- the address space was reused.
+
+The original design, for the reasoning:
+
 A range cannot be reused until every address space that materialised it has
 dropped its mapping. Nothing tells those address spaces on its own: a VMA in
 another mm is an independent kernel object, and `rmap` reaches it only for

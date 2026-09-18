@@ -330,6 +330,7 @@ Status<void> init() {
     LOG(ERR) << "failed to initialize the LibOS arena: " << ret.error();
     return ret;
   }
+  StartArenaGc();
 
   // Hang watchdog. Runs as an ordinary runtime thread, which keeps being
   // scheduled even when every guest thread is blocked -- that is exactly the
