@@ -386,3 +386,80 @@ the place to look.
   before it could print -- which hid the very thing it was built to catch;
 - `usys_munmap` warns (at most 8 times) when it is about to hand a restart
   code back, with the `interrupt_state` the exit gate will see.
+
+
+---
+
+# Status: hang fixed, guest SIGABRT fixed, double-ready still open
+
+Three failures were found under fork/thread churn. Two are fixed; the third is
+one bug with two triggers and is left open with a precise root cause, because
+every point-fix tried so far only moves the symptom.
+
+## Fixed 1 -- the hang (committed, lib/caladan idempotent arm)
+
+The leaked wake credit in `prepare_interruptible`. 18/80 -> 0/120. See the
+earlier sections; unchanged.
+
+## Fixed 2 -- guest SIGABRT during pthread_join (this change, junction mm.cc)
+
+`MemoryMap::{SetBreak,MMap,MProtect,MUnmap,MAdvise}` took the map lock with
+`InterruptOrLock`, which returns EINTR when a signal is pending and the lock is
+contended; `usys_*` turned that into `-ERESTARTSYS`. But Linux never fails these
+calls with EINTR, and glibc's `pthread_join` frees the joined stack with
+`munmap()` and calls `abort()` on *any* failure (nptl/nptl-stack.c:83). Plain
+locks at all five sites. Deterministic repro `thread_churn_storm 3 2 1`: was
+SIGABRT 3/3, now clean 5/5. This is independent of the double-ready below.
+
+## Open -- the double ready (`BUG_ON(th->thread_ready)`)
+
+One probabilistic bug, surfacing through more than one workload. Measured
+rates (small samples, heavy machine-load dependence -- treat as order of
+magnitude, not precise):
+
+- `thread_churn_storm 3 2 1 1` (SA_RESTART): ~1 in 8;
+- the fork storm (`-O -t 8 -s 2 -f 1`): ~8 in 60.
+
+An earlier note in this session called the churn case "deterministic, 3/3";
+that was small-sample luck. It is the same probabilistic double-ready.
+
+Root cause, traced: `interruptible_wake_test()` readies a thread unconditionally
+when `PREPARED_FLAG` is clear (`!check_prepared`). That branch is meant for
+threads that parked with plain `Wait` (no interrupt credit). But an interruptibly
+parked thread reaches it too, when its credit has been cleared out of band --
+`reset_interruptible_state()` and `set_interrupt_state_interrupted()` both
+*write* `interrupt_state` (to 0 and to 1) rather than adding to it, so a thread
+that armed with `WAKER_VAL` can have that credit clobbered. A later `WakeAll`
+then takes the unconditional path and readies a thread that another waker has
+already readied.
+
+Why no point-fix was shipped -- each was measured and each only moves it:
+
+All rates below were measured close together on the same machine; earlier
+cross-session comparisons (e.g. "2/120") are not reliable, machine load moves
+the rate several-fold.
+
+| change | churn SA_RESTART | fork-storm assert | fork-storm hang |
+| --- | --- | --- | --- |
+| munmap only (shipped) | ~1/8 | ~8/60 | 0 |
+| + deliver_interrupt readies only on WAKER_VAL | ~0/5 | ~6/60 | 0 |
+| + interruptible_park sticky bit | 0 | 0 | **~7/60** (lost wakeup) |
+
+`deliver_interrupt` (6/60) vs without it (8/60) is statistically
+indistinguishable (Fisher p ~ 0.8): it does not measurably change the fork
+storm, and its apparent churn win is within noise, so it is not shipped.
+`interruptible_park` does eliminate the assert (0/60, significant) but cannot
+tell "already readied" from "credit reset, still parked", so it drops real
+wakeups -- the assert becomes a hang. Neither is a fix; both only move the
+symptom, which is the evidence that the fix belongs at the istate-accounting
+level.
+
+The correct fix is at the accounting level: no code path may *overwrite*
+`interrupt_state` while a thread holds an arm credit; `reset`/`set-interrupted`
+must be add/sub that preserve `WAKER_VAL`, or must run only when the thread is
+provably not armed. That is an invasive change to the signal subsystem and wants
+a focused pass with the invariants written down, not a storm-rate bisection.
+
+The lightweight diagnostic in `thread_ready_prepare()` (first-waker capture) is
+left in to make the next occurrence self-describing.
+

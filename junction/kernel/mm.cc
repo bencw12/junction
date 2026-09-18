@@ -588,8 +588,7 @@ Status<uintptr_t> MemoryMap::SetBreak(uintptr_t brk_addr) {
   if (newbrk < mm_start_ || newbrk >= mm_end_) return brk_addr_;
 
   // Otherwise, try to adjust the brk address.
-  rt::UniqueLock ul(mu_, rt::InterruptOrLock);
-  if (!ul) return MakeError(EINTR);
+  rt::UniqueLock ul(mu_);
 
   uintptr_t oldbrk = brk_addr_;
 
@@ -656,8 +655,7 @@ Status<void *> MemoryMap::MMap(void *addr, size_t len, int prot, int flags,
   Status<void *> raddr;
   bool reserved_from_global_pool = false;
   {
-    rt::UniqueLock ul(mu_, rt::InterruptOrLock);
-    if (!ul) return MakeError(EINTR);
+    rt::UniqueLock ul(mu_);
 
     if (!(flags & MAP_FIXED)) {
       Status<uintptr_t> ret{MakeError(1)};
@@ -738,8 +736,7 @@ Status<void> MemoryMap::MProtect(void *addr, size_t len, int prot) {
   if (!AddressValid(addr, len)) return MakeError(EINVAL);
 
   // change protections
-  rt::UniqueLock ul(mu_, rt::InterruptOrLock);
-  if (!ul) return MakeError(EINTR);
+  rt::UniqueLock ul(mu_);
 
   // Modify() will make KernelMProtect calls if the tracer is on.
   if (likely(!TraceEnabled())) {
@@ -758,8 +755,13 @@ Status<void> MemoryMap::MUnmap(void *addr, size_t len) {
 
   // clear mappings
   {
-    rt::UniqueLock ul(mu_, rt::InterruptOrLock);
-    if (!ul) return MakeError(EINTR);
+    // A plain lock, not InterruptOrLock: Linux never fails mmap, munmap,
+    // mprotect, madvise or brk with EINTR, and programs are written to that.
+    // glibc frees a joined thread's stack with munmap() and aborts on *any*
+    // failure (nptl/nptl-stack.c), so an interruptible lock here turned a
+    // signal arriving during pthread_join() into SIGABRT. Same change in
+    // SetBreak, MMap, MProtect and MAdvise.
+    rt::UniqueLock ul(mu_);
     // Note: we may need to map a PROT_NONE region to prevent Linux from placing
     // other VMAs here.
     Status<void> ret = KernelMUnmap(addr, len);
@@ -781,8 +783,7 @@ Status<void> MemoryMap::MAdvise(void *addr, size_t len, int hint) {
   if (hint == MADV_FREE && GetCfg().madv_dontneed_remap()) hint = MADV_DONTNEED;
 
   // provide mapping hints
-  rt::SharedLock ul(mu_, rt::InterruptOrLock);
-  if (!ul) return MakeError(EINTR);
+  rt::SharedLock ul(mu_);
   return KernelMAdvise(addr, len, hint);
 }
 
@@ -947,20 +948,7 @@ long usys_mprotect(void *addr, size_t len, int prot) {
 long usys_munmap(void *addr, size_t len) {
   MemoryMap &mm = myproc().get_mem_map();
   Status<void> ret = TracerGuardCheck(mm, [&] { return mm.MUnmap(addr, len); });
-  if (!ret) {
-    long r = MakeCErrorRestartSys(ret);
-    // Diagnostic: a restart code is only safe to return if the syscall exit
-    // path will run RunSignals(), which entry.S gates on interrupt_state > 0
-    // as a *signed* byte. Report what that gate will see.
-    if (r == -ERESTARTSYS) {
-      static std::atomic_int n{0};
-      if (n.fetch_add(1) < 8)
-        LOG(WARN) << "munmap -> ERESTARTSYS with interrupt_state="
-                  << static_cast<int>(atomic8_read(
-                         &mythread().GetCaladanThread()->interrupt_state));
-    }
-    return r;
-  }
+  if (!ret) return MakeCErrorRestartSys(ret);
   return 0;
 }
 
