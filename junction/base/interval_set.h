@@ -5,6 +5,7 @@
 #include <map>
 
 #include "junction/base/error.h"
+#include "junction/base/finally.h"
 #include "junction/snapshot/cereal.h"
 
 namespace junction {
@@ -48,10 +49,17 @@ concept IntervalData =
       { t.TryMergeRight(u) } -> std::convertible_to<bool>;
     };
 
-template <IntervalData T>
+// @Alloc lets a caller decide where the tree's nodes live. The arena's shadow
+// map is consulted from the page-fault handler, so its nodes must come from
+// memory that cannot itself fault (see arena.cc); everything else takes the
+// default.
+template <IntervalData T,
+          typename Alloc = std::allocator<std::pair<const uintptr_t, T>>>
 class ExclusiveIntervalSet {
  public:
-  std::map<uintptr_t, T>::iterator Clear(uintptr_t start, uintptr_t end) {
+  using Map = std::map<uintptr_t, T, std::less<uintptr_t>, Alloc>;
+
+  typename Map::iterator Clear(uintptr_t start, uintptr_t end) {
     auto it = intervals_.upper_bound(start);
     while (it != intervals_.end() && it->second.get_start() < end) {
       T &item = it->second;
@@ -217,7 +225,7 @@ class ExclusiveIntervalSet {
   }
 
  private:
-  bool TryMergeRight(std::map<uintptr_t, T>::iterator prev, T &rhs) {
+  bool TryMergeRight(typename Map::iterator prev, T &rhs) {
     if (prev == intervals_.end()) return false;
     const T &lhs = prev->second;
     if (rhs.TryMergeRight(lhs)) {
@@ -228,7 +236,7 @@ class ExclusiveIntervalSet {
     return false;
   }
 
-  std::map<uintptr_t, T> intervals_;
+  Map intervals_;
 };
 
 }  // namespace junction

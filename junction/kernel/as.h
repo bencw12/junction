@@ -117,4 +117,12 @@ size_t AuditLibOSMemory(bool log_details = true);
 // address spaces, where the guest's own stack does not exist.
 size_t AuditAddressSpaceCoherence(bool log_details = true);
 
+// Calls @fn bound to each live address space other than the caller's, with
+// preemption disabled for the duration of each call (see the note in
+// AuditAddressSpaceCoherence on why). @fn must not block, allocate or log.
+// Returns the number of address spaces visited. Same stack requirement as the
+// audit.
+size_t ForEachOtherAddressSpace(void (*fn)(uint64_t handle, void *ctx),
+                                void *ctx);
+
 }  // namespace junction

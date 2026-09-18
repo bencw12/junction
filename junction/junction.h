@@ -90,6 +90,10 @@ class alignas(kCacheLineSize) JunctionCfg {
   // test the check that reports it. See FrozenViolationProbe().
   [[nodiscard]] bool debug_frozen_probe() const { return debug_frozen_probe_; }
 
+  // Whether to run the LibOS arena's self-test after the first fork. See
+  // ArenaProbe().
+  [[nodiscard]] bool debug_arena_probe() const { return debug_arena_probe_; }
+
   // Seconds of no forward progress before the hang watchdog dumps every
   // thread. Zero disables it.
   [[nodiscard]] size_t debug_hang_watchdog_s() const {
@@ -122,6 +126,7 @@ class alignas(kCacheLineSize) JunctionCfg {
   bool debug_libos_escape_{false};
   bool debug_as_audit_{false};
   bool debug_frozen_probe_{false};
+  bool debug_arena_probe_{false};
   size_t debug_hang_watchdog_s_{0};
   uid_t gid_;
   uid_t uid_;

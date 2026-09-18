@@ -632,7 +632,8 @@ void HandlePageFaultOnSyscallStack(KernelSignalTf &frame, int required_prot,
   // memory: the regions sit above kVirtualAreaMax, where no guest can be given
   // an address, so the map has nothing to say about them.
   bool fault_handled =
-      RepairManagedFault(reinterpret_cast<uintptr_t>(info.si_addr)) ||
+      RepairManagedFault(reinterpret_cast<uintptr_t>(info.si_addr),
+                         required_prot) ||
       myth.get_process().get_mem_map().HandlePageFault(
           reinterpret_cast<uintptr_t>(info.si_addr), required_prot, time);
 
@@ -725,6 +726,11 @@ extern "C" void synchronous_signal_handler(int signo, siginfo_t *info,
     // We might have segfaulted with preemption disabled in the Junction kernel.
     // Not great, but if the page fault handler can fix it, we can keep going.
     if (was_preempt_disabled) {
+      // A managed LibOS region repairs without libc and without blocking, so
+      // it is safe here -- and it has to be: the LibOS takes these faults
+      // under spinlocks, from the very allocators the arena backs.
+      if (RepairManagedFault(reinterpret_cast<uintptr_t>(info->si_addr), prot))
+        return;
       // It is only safe to enter the memory map when preemption is disabled if
       // tracing was enabled, since all MM operations are synchronized with a
       // spin lock during tracing.

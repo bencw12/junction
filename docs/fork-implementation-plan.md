@@ -209,6 +209,44 @@ building it:
 
 ## Phase 2 — The arena
 
+**Status: done.** `scripts/arena_test.sh`, 8/8. `junction/kernel/arena.{h,cc}`:
+`InitLibOSArena()`, `ArenaMap()`, `ArenaUnmap()`, `ArenaProtect()`, and the
+shadow-map repair path inside `RepairManagedFault()`. The slot is at
+`0x530000000000` as planned, 512 GB, sealed memfd, `PROT_NONE` reservation.
+Verified by `--debug_arena_probe`: after the first fork it maps four ranges of
+different shapes, changes one's protection, frees one, and reads all four back
+from every other address space -- 4 faults repaired per address space visited,
+the read-only one reinstalled as read-only, the freed one quarantined and not
+reused. Three things the plan below did not anticipate, all now in:
+
+- **The preemption-disabled fault path never tried a managed repair.**
+  `signal.cc` only consulted the guest memory map there, and only under
+  tracing, so a LibOS fault in *any* managed slot taken under a spinlock was
+  fatal -- memfs included. That is exactly the context Caladan's allocators
+  fault from, so 3a would have hit it immediately. `RepairManagedFault()` now
+  runs there too; it needs no libc and its one lock is never held across a
+  fault. The probe reads back with preemption disabled on purpose, to keep
+  this path under test.
+- **The coherence audit skips managed slots.** A range that is absent until
+  touched is the lazy repair working, not a divergence; without the skip,
+  `--debug_as_audit` would report every arena (and memfs) absence.
+- **`ExclusiveIntervalSet` takes an allocator.** The shadow map's nodes come
+  from the one pre-reserved pool the design keeps (8 MB, `MAP_SHARED`,
+  populated before the first clone, sized from a bound -- see the note in
+  `arena.cc`); everything else takes the default.
+
+Deferred, deliberately: `mremap` (the two interval sets are in place for it,
+nothing calls it yet), and the `MADV_DONTNEED` translation, which belongs with
+the callers Phase 3 routes. `RepairManagedFault()` now also takes the faulting
+access's protection, so a write to a read-only arena range is reported as the
+protection fault it is rather than repaired in a loop.
+
+One thing for anyone writing a test: `dash` uses `vfork` for a plain command
+and `fork` only for `&`, subshells and pipelines. A vfork child shares its
+parent's address space until it execs, so a test that needs a second address
+space has to force a real fork (`sleep 0.2 & wait`, as `guardrail_test.sh`
+does).
+
 **2a. The slot.** 512 GB at `0x530000000000` (next free above Caladan's
 relocated page pool at `0x510000000000` and stack pool at `0x520000000000`). One
 memfd, `ftruncate` to the slot size, `MFD_EXEC` where available with a fallback

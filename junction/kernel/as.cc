@@ -18,6 +18,7 @@ extern "C" {
 #include "junction/bindings/log.h"
 #include "junction/bindings/sync.h"
 #include "junction/junction.h"
+#include "junction/kernel/arena.h"
 #include "junction/kernel/as.h"
 #include "junction/kernel/ksys.h"
 #include "junction/kernel/mm.h"
@@ -477,6 +478,48 @@ bool RangeIsCovered(const Mapping *maps, size_t n, uintptr_t start,
 
 }  // namespace
 
+namespace {
+
+// Every live address space except @home, into @out (sized kMaxTrackedAS).
+// The root is never registered -- it is not created by a clone -- but it is
+// an address space like any other and diverges like any other.
+size_t CollectOtherAddressSpaces(uint64_t *out, uint64_t home) {
+  size_t n = 0;
+  {
+    rt::SpinGuard g(as_registry.lock);
+    for (size_t i = 0; i < as_registry.n; i++)
+      if (as_registry.handles[i] != home) out[n++] = as_registry.handles[i];
+  }
+  if (home != kRootAddressSpace && n < kMaxTrackedAS) out[n++] = kRootAddressSpace;
+  return n;
+}
+
+}  // namespace
+
+size_t ForEachOtherAddressSpace(void (*fn)(uint64_t, void *), void *ctx) {
+  if (!MultipleAddressSpacesExist()) return 0;
+  const uint64_t home = GetActiveAddressSpace();
+
+  static uint64_t others[kMaxTrackedAS];
+  static rt::Spin others_lock;
+  rt::SpinGuard visiting(others_lock);
+  size_t n_others = CollectOtherAddressSpaces(others, home);
+
+  size_t visited = 0;
+  for (size_t i = 0; i < n_others; i++) {
+    // Preemption off for the whole visit: on_sched() rebinds the core to the
+    // scheduled thread's address space, so being descheduled here would strand
+    // the rest of @fn in somebody else's mappings.
+    rt::Preempt preempt;
+    rt::PreemptGuard nopreempt(preempt);
+    if (!TryActivateAddressSpace(others[i])) continue;
+    fn(others[i], ctx);
+    ActivateAddressSpace(home);
+    visited++;
+  }
+  return visited;
+}
+
 size_t AuditAddressSpaceCoherence(bool log_details) {
   if (!MultipleAddressSpacesExist() || !maps_other) return 0;
 
@@ -489,18 +532,7 @@ size_t AuditAddressSpaceCoherence(bool log_details) {
   static uint64_t others[kMaxTrackedAS];  // 8 KB; too big for a runtime stack
   static rt::Spin others_lock;
   rt::SpinGuard visiting(others_lock);
-
-  size_t n_others = 0;
-  {
-    rt::SpinGuard g(as_registry.lock);
-    for (size_t i = 0; i < as_registry.n; i++)
-      if (as_registry.handles[i] != home)
-        others[n_others++] = as_registry.handles[i];
-  }
-  // The root is never registered -- it is not created by a clone -- but it is
-  // an address space like any other and diverges like any other.
-  if (home != kRootAddressSpace && n_others < kMaxTrackedAS)
-    others[n_others++] = kRootAddressSpace;
+  size_t n_others = CollectOtherAddressSpaces(others, home);
 
   size_t divergences = 0;
   for (size_t i = 0; i < n_others; i++) {
@@ -534,6 +566,9 @@ size_t AuditAddressSpaceCoherence(bool log_details) {
     for (size_t j = 0; j < *ref_n; j++) {
       const Mapping &m = maps_ref[j];
       if (!IsLibOSMapping(m, guest)) continue;
+      // Managed regions are *meant* to be absent until touched: that is the
+      // lazy repair working, not a divergence.
+      if (AddressIsManaged(m.start)) continue;
       bool differs = false;
       if (!RangeIsCovered(maps_other, other_n, m.start, m.end, m.prot,
                           &differs)) {
@@ -548,6 +583,7 @@ size_t AuditAddressSpaceCoherence(bool log_details) {
     // the fork, which the reference address space will never see.
     for (size_t j = 0; j < other_n; j++) {
       const Mapping &m = maps_other[j];
+      if (AddressIsManaged(m.start)) continue;
       if (!IsLibOSMapping(m, guest)) continue;
       bool differs = false;
       if (!RangeIsCovered(maps_ref, *ref_n, m.start, m.end, m.prot, &differs))

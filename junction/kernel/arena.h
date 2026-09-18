@@ -8,27 +8,29 @@
 //
 // The fix is not to propagate mappings eagerly, which would mean touching
 // every address space on every allocation. It is to make the divergence
-// *repairable*: put the memory in a region that is backed 1:1 by a single
-// file, so that a fault anywhere in it can be turned back into the correct
-// mapping with arithmetic alone.
+// *repairable*: put the memory in a region backed by a single file, so that a
+// fault anywhere in it can be turned back into the correct mapping.
 //
-//     addr in [slot.base, slot.base + slot.len)  =>  offset = addr - slot.base
+// Two kinds of region do that here.
 //
-// A managed slot is such a region. When a fault lands in one, the handler maps
-// the enclosing granule from the slot's file at the matching offset and
-// retries the instruction. No bookkeeping is consulted, no lock is taken, and
-// the repair is idempotent, so two cores faulting on the same range race
-// harmlessly.
+// A *managed slot* is backed 1:1 by a file: offset = addr - base, and a fault is
+// repaired with arithmetic alone, no bookkeeping consulted. memfs uses one.
 //
-// The correctness condition is the one the whole design rests on:
+// The *LibOS arena* is a managed slot whose bindings are not 1:1: a shadow map
+// records, for every mapped range, the memfd offset and protection behind it,
+// and a fault is repaired by looking the range up. Losing the arithmetic
+// shortcut is what lets a range be freed and its offset punched without ever
+// being reused for something else -- and that quarantine is the correctness
+// condition the whole design rests on:
 //
 //     an address range is never reused for a different (fd, offset) binding
 //     until it has been unmapped from every address space that materialised it
 //
 // With it, every divergence between address spaces is an *absence*, absences
 // fault, and faults are repaired here. Without it a repair would silently hand
-// back somebody else's bytes. See UnmapFromAllAddressSpaces(), which is how
-// memfs discharges that condition when a file is deleted.
+// back somebody else's bytes. Reuse is deferred to garbage collection, which
+// is how the condition is discharged; until then a freed range stays
+// quarantined and a fault in it is a genuine use-after-free, reported as one.
 
 #pragma once
 
@@ -48,12 +50,14 @@ namespace junction {
 Status<void> RegisterManagedSlot(const char *name, uintptr_t base, size_t len,
                                  size_t granule, int fd, int prot);
 
-// Repairs a fault at @addr if it lands in a managed slot. Returns false if the
-// address is not managed, in which case the fault is somebody else's problem.
+// Repairs a fault at @addr if it lands in a managed slot and the mapping that
+// belongs there permits @required_prot (PROT_READ/WRITE/EXEC of the faulting
+// access). Returns false if the address is not managed or the access would
+// still fault after repair, in which case the fault is somebody else's problem.
 //
-// Runs in signal context on the syscall stack: no libc, no allocation, no
-// locks.
-[[nodiscard]] bool RepairManagedFault(uintptr_t addr);
+// Safe to call with preemption disabled and from signal context: no libc, no
+// allocation, and the only lock it may take is never held across a fault.
+[[nodiscard]] bool RepairManagedFault(uintptr_t addr, int required_prot);
 
 // Whether @addr lies in a managed slot. For diagnostics and assertions.
 [[nodiscard]] bool AddressIsManaged(uintptr_t addr);
@@ -61,5 +65,52 @@ Status<void> RegisterManagedSlot(const char *name, uintptr_t base, size_t len,
 // How many faults have been repaired, for tests and for noticing when a
 // workload is faulting far more than it should.
 [[nodiscard]] uint64_t ManagedFaultCount();
+
+// --- The LibOS arena (Phase 2 of docs/fork-implementation-plan.md) ---
+
+// Creates the arena: one sealed memfd, a PROT_NONE reservation over its slot
+// in the virtual address space, and the node pool the shadow map lives in.
+// Must run before the first address space is cloned, so that all three exist
+// in every address space.
+Status<void> InitLibOSArena();
+
+// Maps @len bytes (page-aligned) of fresh arena memory with @prot into the
+// calling address space and records the binding. Other address spaces receive
+// it on first touch. The memory is zero-filled.
+Status<void *> ArenaMap(size_t len, int prot);
+
+// Frees [addr, addr+len), which must be live arena memory: the physical pages
+// are punched out of the memfd, the range is unmapped here, and the address
+// range and its offsets are quarantined -- never handed out again by ArenaMap
+// -- until garbage collection has unmapped them everywhere.
+Status<void> ArenaUnmap(void *addr, size_t len);
+
+// Changes the protection of [addr, addr+len), which must be live arena memory,
+// here and in the shadow map. An address space that already holds the range
+// with the old protection keeps it until an access there faults.
+Status<void> ArenaProtect(void *addr, size_t len, int prot);
+
+// Whether @addr is inside the arena's slot at all, and whether it is currently
+// live (mapped, not quarantined). Both for diagnostics and tests.
+[[nodiscard]] bool ArenaContains(uintptr_t addr);
+[[nodiscard]] bool ArenaIsLive(uintptr_t addr);
+
+struct ArenaStats {
+  size_t mapped_bytes;       // live
+  size_t quarantined_bytes;  // freed, awaiting GC
+  size_t live_entries;       // shadow-map entries, live
+  size_t dead_entries;       // shadow-map entries, quarantined
+  size_t nodes_in_use;       // of the node pool
+  size_t nodes_capacity;
+  size_t punch_failures;     // frees whose PUNCH_HOLE failed (memory not reclaimed)
+};
+[[nodiscard]] ArenaStats GetArenaStats();
+
+// Self-test, enabled by --debug_arena_probe: after the first fork, maps arena
+// memory in this address space and reads it back from every other one, so the
+// shadow-map repair path is exercised on demand rather than waiting for a
+// workload to reach it. Also checks that a freed range is not reused. Logs
+// "arena probe: PASS" or "arena probe: FAIL: <why>".
+void ArenaProbe();
 
 }  // namespace junction

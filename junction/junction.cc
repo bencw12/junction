@@ -17,6 +17,7 @@ extern "C" {
 #include <base/mem.h>
 }
 
+#include "junction/kernel/arena.h"
 #include "junction/kernel/as.h"
 #include "junction/kernel/memtrace.h"
 #include "kern/junction_as.h"
@@ -123,6 +124,10 @@ po::options_description GetOptions() {
        "dump every process and thread if no guest thread accrues runtime for "
        "this many seconds (0 disables). For diagnosing hangs where every "
        "kthread parks and nothing is runnable.")  //
+      ("debug_arena_probe", po::bool_switch(),
+       "after the first fork, map LibOS arena memory here and read it back "
+       "from every other address space, to test the shadow-map repair (test "
+       "only)")  //
       ("debug_frozen_probe", po::bool_switch(),
        "after the first fork, deliberately change LibOS memory in one address "
        "space, to test that the frozen-invariant check notices (test only)")  //
@@ -232,6 +237,7 @@ Status<void> JunctionCfg::FillFromArgs(int argc, char *argv[]) {
   debug_libos_escape_ = vm["debug_libos_escape"].as<bool>();
   debug_as_audit_ = vm["debug_as_audit"].as<bool>();
   debug_frozen_probe_ = vm["debug_frozen_probe"].as<bool>();
+  debug_arena_probe_ = vm["debug_arena_probe"].as<bool>();
   debug_hang_watchdog_s_ = vm["debug_hang_watchdog"].as<size_t>();
   mas_enabled_ = !vm["no_mas"].as<bool>() &&
                  access(JUNCTION_AS_DEVICE, R_OK | W_OK) == 0;
@@ -312,6 +318,16 @@ Status<void> init() {
   ret = InitAddressSpaces();
   if (unlikely(!ret)) {
     LOG(ERR) << "failed to initialize address spaces: " << ret.error();
+    return ret;
+  }
+
+  // The LibOS arena: where LibOS memory goes so that any address space can
+  // repair an absence from the memfd behind it. Before any guest exists, for
+  // the same reason as above -- its reservation and its node pool have to be
+  // in every address space, and only a clone puts them there.
+  ret = InitLibOSArena();
+  if (unlikely(!ret)) {
+    LOG(ERR) << "failed to initialize the LibOS arena: " << ret.error();
     return ret;
   }
 

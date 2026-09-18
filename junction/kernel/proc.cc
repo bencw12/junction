@@ -26,6 +26,7 @@ extern "C" {
 #include "junction/bindings/sync.h"
 #include "junction/bindings/timer.h"
 #include "junction/junction.h"
+#include "junction/kernel/arena.h"
 #include "junction/kernel/as.h"
 #include "junction/kernel/memtrace.h"
 #include "junction/kernel/futex.h"
@@ -475,6 +476,7 @@ Status<std::shared_ptr<Process>> Process::CreateProcessFork(
   // The probe first, so a single fork is enough to test the audit: it creates
   // the divergence that the audit immediately afterwards has to find.
   if (unlikely(GetCfg().debug_frozen_probe())) FrozenViolationProbe();
+  if (unlikely(GetCfg().debug_arena_probe())) ArenaProbe();
   if (unlikely(GetCfg().debug_as_audit())) AuditAddressSpaceCoherence();
 
   std::shared_ptr<MemoryMap> mm = MemoryMap::Fork(*mem_map_, *as);
