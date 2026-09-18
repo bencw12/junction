@@ -481,10 +481,14 @@ Status<void> ArenaUnmap(void *addr, size_t len) {
         start, end, [](const ShadowEntry &e) { return !e.dead_; },
         [](ShadowEntry &e) { e.dead_ = true; });
 
-    // Unmap here. Other address spaces keep their stale mapping over the
-    // punched offsets -- it reads as zeros and the range is quarantined, so it
-    // cannot be confused with anything live -- until garbage collection.
-    ksys_munmap(addr, len);
+    // Put the reservation back over the range, rather than munmap: a hole
+    // would be free address space that a foreign mmap(NULL) could land in,
+    // and the slot is meant to stay ours. Same single syscall either way.
+    // Other address spaces keep their stale mapping over the punched offsets
+    // -- it reads as zeros and the range is quarantined, so it cannot be
+    // confused with anything live -- until garbage collection.
+    ksys_mmap(addr, len, PROT_NONE,
+              MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED, -1, 0);
     arena.mapped -= len;
     arena.quarantined += len;
     arena.punch_failures += failed;
