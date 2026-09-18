@@ -43,6 +43,11 @@ int as_dev_fd = -1;
 // Stack handed to the throwaway clone that materializes a new address space.
 // Deliberately MAP_PRIVATE: each clone gets its own copy-on-write page, so a
 // signal delivered to one of them cannot disturb Junction or its siblings.
+// The stack the parked clone runs on for the instant between clone() and its
+// SIGKILL. MAP_PRIVATE on purpose, and exempt from the sharing audit: nothing
+// shared ever lives here -- the clone never returns and touches nothing
+// Junction owns -- and making it shared would put a stack that two clones
+// could run on concurrently into every address space.
 void *clone_stack_top = nullptr;
 constexpr size_t kCloneStackSize = 16 * kPageSize;
 

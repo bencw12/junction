@@ -47,6 +47,16 @@ LibOS object to be allocated under one address space and used from another.
 **RSS becomes a high-water mark, not current usage.** Upstream returned freed
 memory to the OS; the pooled path does not.
 
+> **Measured later, and this attribution was wrong.** With the pools replaced by
+> regions that punch on every free, the same 3000-pipe experiment holds the same
+> ~190 MB after the pipes close. The pages are never freed to the region at
+> all: the slab returns a page only when every object in it is free, which
+> magazines and fragmentation prevent, and `stack_reclaim()` ran zero times
+> across 1023 thread create/join cycles. The high-water mark is allocator
+> caching above the pools, present upstream too; the pools only removed the
+> `munmap` that would never have been reached. See "Measurements" in
+> `docs/fork-implementation-plan.md`.
+
 ```c
 /* upstream */                         /* mas-pools */
 static void lgpage_destroy(...) {      static void lgpage_destroy(...) {

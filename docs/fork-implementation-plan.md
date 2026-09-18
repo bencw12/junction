@@ -571,6 +571,60 @@ not a defence.
 
 ## Phase 4 — Fold the startup sweep into the arena
 
+**Status: skipped, deliberately, except the comment.** The sweep's mappings all
+predate the first clone, so every address space inherits them; they never
+fault as absent, so recording them in the shadow map would never be consulted,
+and consolidating 27 memfds into one is tidiness with no behaviour behind it.
+The clone stack now carries the comment saying why it is exempt. Revisit only
+if a mapping made *before* the sweep ever needs repairing, which today none
+does.
+
+**memfs as an arena client (the Phase 2 follow-on): deferred.** It is a real
+rewrite with semantic edges the 1:1 layout does not have -- a guest that
+`mmap`s a file and then *extends* it needs offsets that do not exist yet;
+guest mappings over fragmented offsets must be installed piece by piece; the
+snapshot archive format changes -- for a benefit that is address-space economy
+(a 4 KB file costs 4 KB, the 16384-file cap goes). Today's memfs is correct,
+simple, tested 13/13, and needs no GC because a slot's binding never changes.
+Do it when the cap or the granule actually bites.
+
+## Measurements after Phases 2, 3 and 5
+
+**fork() to the child's first instruction**, medians, same harness as
+`docs/multi-address-space.md`:
+
+| parent footprint | Linux | Junction, before | Junction, now |
+| --- | --- | --- | --- |
+| 0 MB | 66 us | 142 us | 151 us |
+| 16 MB | 216 us | 236 us | 274 us |
+| 64 MB | 647 us | 531 us | 540 us |
+
+A modest increase, largest at 16 MB, plausibly the three reservations, the
+memfd-backed region VMAs, and the clone-time GC slot; single-sample medians,
+so within a few runs' noise. Recorded, not chased.
+
+**RSS does not come back, and the pools were never why.**
+`docs/pools-are-load-bearing.md` listed "RSS becomes a high-water mark" as a
+cost of the pools -- 190.3 MB held after 3000 pipes were closed -- because the
+pooled `lgpage_destroy` skipped the `munmap` upstream did. With the pools
+replaced by regions that punch on free, the same experiment gives the same
+number: the large-page region holds 194,832 KB before *and after* the pipes
+close (`smaps`, two VMAs: the merged memfd mapping and the reservation). The
+punch never runs because nothing above the region frees a whole unit: the slab
+returns a page only when every object in it is free (`slab.c`,
+`item_count == nr_elems`), which tcache magazines and fragmentation prevent;
+and across 1023 thread create/join cycles `stack_reclaim()` ran **zero** times
+(`strace`: no `MADV_REMOVE`; the 853 `MADV_DONTNEED`s are glibc trimming
+*guest* stacks), because freed stacks sit in cached magazines. So the regions
+restore the *ability* to return memory -- a freed page or a reclaimed stack
+is punched -- but the layers above them do not free, and upstream Caladan has
+the same layers. Making the slab release empty pages, or reclaiming stacks on
+thread exit, is allocator policy work, separate from address spaces, to take
+on only if the high-water mark matters for a real workload.
+
+(Incidental: a guest could create 1023 threads, then `pthread_create` failed
+-- a per-process limit in Junction, unrelated to memory. Noted, not pursued.)
+
 `ShareLibOSMemory()` already does the hard part: it reads `/proc/self/maps`
 before the first guest and converts private-writable LibOS mappings to shared,
 with `AuditLibOSMemory()` checking the result. Two changes:
