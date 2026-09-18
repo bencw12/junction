@@ -423,25 +423,51 @@ magnitude, not precise):
 An earlier note in this session called the churn case "deterministic, 3/3";
 that was small-sample luck. It is the same probabilistic double-ready.
 
-Root cause: NOT yet found. What is established by measurement:
+Mechanism, from a per-thread event ring dumped at the assertion (tags:
+`A`=arm, `I`=deliver_interrupt readies, `R`/`r`=thread_ready() call
+(lowercase = target already ready), `C`=scheduler dispatch clears
+thread_ready). A representative capture:
 
-- the second ready fires with `istate=0 armed=0` -- the thread is not on any
-  wait queue and holds no credit when it is readied again. So it is not a
-  `WakeAll` popping a still-armed thread;
-- the first and second readies come from different wakers (captured pairs
-  include `WaitQueue::WakeAll` + `Process::SignalThread`, and
-  `Process::SignalThread` + `FutexTable::Wake`);
-- `interruptible_wake_test()` readies unconditionally when `PREPARED_FLAG` is
-  clear, and the doubled thread has it clear -- so that branch is how the
-  second ready gets through. What is not known is why the thread is still
-  reachable by a second waker after the first ready.
+```
+A(65) R C   I(66) R C   I(66) R C   I(66) R C   A(65) R(0x17) r(0x17) C
+                                                        ^^^^^^^^^^^^^^^ the double
+```
 
-A hypothesis stated in an earlier version of this doc -- that
-`reset_interruptible_state()` / `set_interrupt_state_interrupted()` clobber a
-live `WAKER_VAL` credit -- was **tested and refuted**: across 30 storm runs
-(324,585 such writes) every one hit a thread with `armed=0 ready=0`, i.e. the
-normal reset of a thread that had already left its queue; none hit an armed or
-already-ready thread. That mechanism is not it.
+Established:
+
+- both readies of the doubled thread come from the **same caller and the same
+  queue instance** -- `WaitQueue::WakeAll` on pid 1's `child_waiters_`
+  (`q1 == q2`, `FIRST` low byte == `SECOND` low byte == 0x17);
+- the interrupt-wake cycles (`I` then `R`) show the load-bearing fact:
+  **`deliver_interrupt()` readies a thread without removing it from its
+  `WaitQueue`.** It is a Caladan primitive and does not know about the
+  bindings-layer `WaitQueue`. So a thread that is interrupt-woken while armed on
+  `child_waiters_` stays linked, `thread_ready=true`, until it later runs and
+  disarms;
+- a `WakeAll` (from a concurrent SIGCHLD) landing in that window pops the
+  still-linked thread and readies it a second time -> `BUG_ON(th->thread_ready)`.
+
+So the two wakers do not coordinate removal-before-ready across the two
+mechanisms. `interruptible_wake_test()`'s refcount handles the case where the
+credit is still present (`istate=66`, flag set -> the subtraction is non-zero,
+no second ready); the hole is the `istate=0` / flag-clear branch, which readies
+unconditionally.
+
+Not yet closed: the exact step that leaves the doubled thread with `istate=0`
+(no credit, flag clear) while still reachable on `child_waiters_`. `istate=0`
+implies it was armed without `prepare_interruptible` (a plain `Wait`), yet
+`DoWait` uses `WaitInterruptible` (which prepares). Reconciling those two is the
+remaining question, and it is where the fix has to be designed -- probably by
+making `deliver_interrupt` (or the WaitQueue arm) keep the queue membership and
+the readiness in agreement, so a thread is never both `thread_ready` and
+poppable by another waker.
+
+A hypothesis from an earlier revision -- that `reset_interruptible_state()` /
+`set_interrupt_state_interrupted()` clobber a live `WAKER_VAL` credit -- was
+tested (log every such write landing on a thread with `PREPARED_FLAG` set) and
+**refuted**: 324,585 such writes over 30 runs, all on threads with
+`armed=0 ready=0` (the normal post-wake reset), none on an armed or ready
+thread.
 
 Why no point-fix was shipped -- each was measured and each only moves it:
 
