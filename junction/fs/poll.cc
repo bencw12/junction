@@ -58,15 +58,25 @@ int DoPoll(pollfd *fds, nfds_t nfds, std::optional<Duration> timeout,
     int &nevents;
   } args = {lock, waker, nevents};
 
+  // The triggers below fire in the *waker's* context -- whichever thread
+  // produced the event, which may belong to another process and so be bound
+  // to another address space, where this process's guest memory does not
+  // exist. So a trigger must not touch @fds. Each records into this LibOS-side
+  // copy instead (LibOS memory is the same in every address space), and the
+  // results are written back to the guest below, by this thread, in its own
+  // address space. Same shape as select's select_fd.
+  std::vector<short> revents(nfds);
+  for (nfds_t i = 0; i < nfds; i++) revents[i] = fds[i].revents;
+
   // Setup a trigger for each file.
   std::vector<Poller> triggers;
   triggers.reserve(nfds);
   for (nfds_t i = 0; i < nfds; i++) {
-    triggers.emplace_back([&args, &entry = fds[i]](unsigned int pev) {
-      int delta = entry.revents > 0 ? -1 : 0;
-      short events = static_cast<short>(pev);
-      entry.revents = events & (entry.events | kPollErr | kPollHUp);
-      delta += entry.revents > 0 ? 1 : 0;
+    triggers.emplace_back([&args, &rev = revents[i],
+                           events = fds[i].events](unsigned int pev) {
+      int delta = rev > 0 ? -1 : 0;
+      rev = static_cast<short>(pev) & (events | kPollErr | kPollHUp);
+      delta += rev > 0 ? 1 : 0;
       if (delta != 0) {
         rt::SpinGuard g(args.lock);
         args.nevents += delta;
@@ -102,6 +112,9 @@ int DoPoll(pollfd *fds, nfds_t nfds, std::optional<Duration> timeout,
       src.Attach(triggers[i]);
     }
   }
+
+  // Back in this thread's own address space: publish the results.
+  for (nfds_t i = 0; i < nfds; i++) fds[i].revents = revents[i];
 
   if (nevents == 0 && signaled) {
     // Restart the syscall if the timer doesn't need to be adjusted

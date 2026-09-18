@@ -252,11 +252,12 @@ Status<size_t> SnapshotMaps(Mapping *out) {
 }
 
 // A mapping that belongs to the LibOS rather than to a guest process.
-bool IsLibOSMapping(const Mapping &m, const std::vector<AddressRange> &guest) {
-  for (const AddressRange &r : guest)
-    if (m.start >= r.start && m.end <= r.end) return false;
-  return true;
-}
+// The address space is partitioned: guests are confined below
+// kVirtualAreaMax and the LibOS lives above it. Classify by that, not by the
+// *current* process's regions -- with several guests alive at once, another
+// process's memory (excluded from every clone but its own) would otherwise be
+// reported as a LibOS mapping that failed to propagate.
+bool IsLibOSMapping(const Mapping &m) { return m.start >= kVirtualAreaMax; }
 
 // Mappings the sweep must leave alone.
 bool IsExemptFromSharing(const Mapping &m) {
@@ -446,7 +447,6 @@ Status<uint64_t> CloneCurrentAddressSpace(
 
 size_t AuditLibOSMemory(bool log_details) {
   if (!maps_ref) return 0;
-  auto guest = MemoryMap::GetReservedRegions();
 
   Status<size_t> n = SnapshotMaps(maps_ref);
   if (!n) return 0;
@@ -460,7 +460,7 @@ size_t AuditLibOSMemory(bool log_details) {
             reinterpret_cast<uintptr_t>(clone_stack_top) - kCloneStackSize)
       continue;
     if (IsExemptFromSharing(m)) continue;
-    if (!IsLibOSMapping(m, guest)) continue;
+    if (!IsLibOSMapping(m)) continue;
     bad++;
     if (log_details)
       LOG(WARN) << "as: LibOS mapping is private and writable: " << std::hex
@@ -558,7 +558,6 @@ size_t AuditAddressSpaceCoherence(bool log_details) {
   if (!MultipleAddressSpacesExist() || !maps_other) return 0;
 
   // Take the reference snapshot in whichever address space we are already in.
-  auto guest = MemoryMap::GetReservedRegions();
   Status<size_t> ref_n = SnapshotMaps(maps_ref);
   if (!ref_n) return 0;
   const uint64_t home = GetActiveAddressSpace();
@@ -599,7 +598,7 @@ size_t AuditAddressSpaceCoherence(bool log_details) {
     // propagation bug, seen from the other end.
     for (size_t j = 0; j < *ref_n; j++) {
       const Mapping &m = maps_ref[j];
-      if (!IsLibOSMapping(m, guest)) continue;
+      if (!IsLibOSMapping(m)) continue;
       // Managed regions are *meant* to be absent until touched: that is the
       // lazy repair working, not a divergence.
       if (AddressIsManaged(m.start)) continue;
@@ -618,7 +617,7 @@ size_t AuditAddressSpaceCoherence(bool log_details) {
     for (size_t j = 0; j < other_n; j++) {
       const Mapping &m = maps_other[j];
       if (AddressIsManaged(m.start)) continue;
-      if (!IsLibOSMapping(m, guest)) continue;
+      if (!IsLibOSMapping(m)) continue;
       bool differs = false;
       if (!RangeIsCovered(maps_ref, *ref_n, m.start, m.end, m.prot, &differs))
         if (!extra++) first_extra = m.start;
