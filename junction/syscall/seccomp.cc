@@ -20,6 +20,7 @@ extern "C" {
 #include "junction/kernel/ksys.h"
 #include "junction/kernel/memtrace.h"
 #include "junction/kernel/mm.h"
+#include "junction/kernel/arena.h"
 #include "junction/kernel/as.h"
 #include "junction/kernel/proc.h"
 #include "junction/kernel/sigframe.h"
@@ -269,13 +270,17 @@ extern "C" void syscall_trap_handler(int nr, siginfo_t *info,
     long arg3 = static_cast<long>(ctx->uc_mcontext.r10);
     long arg4 = static_cast<long>(ctx->uc_mcontext.r8);
     long arg5 = static_cast<long>(ctx->uc_mcontext.r9);
-    auto res = ksys_default(arg0, arg1, arg2, arg3, arg4, arg5, sysn);
 
     // This is where Junction's own glibc ends up: its mmap is outside the
-    // ksys range, so seccomp traps it and it is executed natively here --
-    // landing in whichever address space this core is currently bound to.
-    // Worth seeing, because those mappings are the ones that do not
-    // propagate.
+    // ksys range, so seccomp traps it here. Executed natively it would land
+    // in whichever address space this core is currently bound to, invisible
+    // to every other one. So the arena serves it instead: anonymous memory
+    // comes out of the arena, and munmap / mprotect / mremap / madvise of
+    // arena memory go back to it. What the arena declines (file mappings,
+    // shared memory) still runs natively, and the trace shows which.
+    long res;
+    if (!RouteLibOSMemSyscall(sysn, arg0, arg1, arg2, arg3, arg4, arg5, &res))
+      res = ksys_default(arg0, arg1, arg2, arg3, arg4, arg5, sysn);
     if (unlikely(MemTraceEnabled())) TraceTrappedMemSyscall(ctx, sysn, res);
 
     ctx->uc_mcontext.rax = static_cast<unsigned long>(res);

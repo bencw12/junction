@@ -663,32 +663,12 @@ Status<void> InitAddressSpaces() {
     return {};
   }
 
-  // Stop glibc from creating new per-thread arenas, and from handing memory
-  // back to the kernel. Both would introduce private mappings after the sweep
-  // below has run.
-  mallopt(M_ARENA_MAX, 1);
-  mallopt(M_TRIM_THRESHOLD, std::numeric_limits<int>::max());
-  mallopt(M_MMAP_THRESHOLD, std::numeric_limits<int>::max());
-
-  // Grow the heap once, up front, so that later allocations are served from
-  // memory the sweep has already made shared.
-  //
-  // The reserve is what keeps LibOS allocations out of a single address space,
-  // so the only way to exercise the overflow is to exhaust it -- which normally
-  // takes 64 MB of live LibOS heap. JUNCTION_DEBUG_HEAP_RESERVE_MB shrinks it,
-  // reaching the identical path at a testable size. Same affordance as
-  // JUNCTION_DEBUG_STACK_POOL_ENTRIES and JUNCTION_DEBUG_LGPAGE_POOL_ENTRIES.
-  // See docs/traces/heap_overflow_race.c.
-  size_t kHeapReserve = 64UL << 20;
-  if (const char *e = std::getenv("JUNCTION_DEBUG_HEAP_RESERVE_MB")) {
-    long mb = std::atol(e);
-    if (mb >= 0) kHeapReserve = static_cast<size_t>(mb) << 20;
-  }
-  void *reserve = kHeapReserve ? std::malloc(kHeapReserve) : nullptr;
-  if (reserve) {
-    std::memset(reserve, 0, kHeapReserve);
-    std::free(reserve);
-  }
+  // Nothing is done to glibc here any more. Its heap growth, per-thread
+  // arenas and large allocations all reach the kernel as mmap from Junction's
+  // libc, which seccomp traps and the LibOS arena serves (arena.cc); that
+  // memory is repaired on demand in every address space, so there is no
+  // reserve to pre-grow and no reason to stop glibc from mapping. The old
+  // 64 MB pre-grown heap was the last pre-reserved pool.
 
   // Before the sweep, so the buffers are shared (and therefore skipped by it),
   // and before any clone, so they exist in every address space later.

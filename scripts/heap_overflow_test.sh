@@ -2,21 +2,23 @@
 #
 # heap_overflow_test.sh - Junction's own glibc heap across address spaces.
 #
-# Junction pre-grows its heap by 64 MB at init and the address-space sweep makes
-# that region MAP_SHARED, so every address space sees it. Past the reserve glibc
-# cannot use brk (the seccomp handler forces it to 0), so it falls back to mmap,
-# which the SIGSYS handler executes natively into whichever address space the
-# calling core is bound to. glibc's free lists are shared LibOS state, so that
-# chunk can then be handed to LibOS code running under a different address
-# space.
+# Junction's glibc reaches the kernel with mmap (brk is forced to 0), and
+# seccomp traps it. It used to be executed natively, into whichever address
+# space the calling core was bound to; glibc's free lists are shared LibOS
+# state, so that chunk could then be handed to LibOS code running under a
+# different address space, which crashed on it. Junction papered over this by
+# pre-growing its heap 64 MB at init and stopping glibc from mapping more --
+# a pre-reserved pool with a cliff.
 #
-# Part 1 forces the allocation with --debug_libos_alloc and dereferences it from
-# another address space. Part 2 asks whether a *guest* can drive the same heap
-# growth on its own -- it cannot, at the sizes tried, which is the more useful
-# result and the reason this ranks below the stack pool.
+# Phase 3b of docs/fork-implementation-plan.md: the trapped mmap is served by
+# the LibOS arena instead, and the pool is gone. An arena range is absent from
+# an address space that never touched it and repaired on first touch, so the
+# check is not "is it in the map" but "does a touch from another address space
+# read back the bytes the first one wrote".
 #
-# EXPECTED TODAY: part 1 crashes. Regression test for the fix in
-# docs/fork-implementation-plan.md.
+# Part 1 forces the allocation with --debug_libos_alloc under a forked guest's
+# address space and touches it from another. Part 2 asks whether a *guest* can
+# drive LibOS heap growth on its own, for the record.
 #
 set -u
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -41,26 +43,29 @@ fail=0
 for i in $(seq 1 "${ATTEMPTS}"); do
     out=$(cd "${BUILD}" && timeout 120 ./junction_run "${CFG}" \
           --debug_libos_alloc "${MB}" -- ./probe_guest 2>&1)
-    if echo "${out}" | grep -q "Aborting on signal"; then
-        addr=$(echo "${out}" | grep -oE "at 0x[0-9a-f]+" | head -1)
-        echo "    attempt ${i}: CRASH ${addr} (ABSENT, then dereferenced)"
+    if echo "${out}" | grep -q "Aborting on signal\|WRONG BYTES"; then
+        why=$(echo "${out}" | grep -oE "at 0x[0-9a-f]+|WRONG BYTES" | head -1)
+        echo "    attempt ${i}: CRASH/WRONG ${why}"
         fail=$((fail + 1))
+    elif echo "${out}" | grep -q "REPAIRED ON TOUCH (read 0xab"; then
+        echo "    attempt ${i}: ok - absent, repaired on touch, bytes match"
     elif echo "${out}" | grep -q "PRESENT"; then
-        echo "    attempt ${i}: ok - mapping reached the other address space"
+        echo "    attempt ${i}: ok - already present in the other address space"
     else
         echo "    attempt ${i}: inconclusive"
+        fail=$((fail + 1))
     fi
 done
 
 echo
 echo "[2] guest-driven: can a guest grow the LibOS heap past the reserve?"
-out=$(cd "${BUILD}" && JUNCTION_DEBUG_HEAP_RESERVE_MB=0 timeout 240 \
+out=$(cd "${BUILD}" && timeout 240 \
       ./junction_run "${CFG}" --trace_libos_mem /tmp/heap_trace.txt -- \
       ./heap_overflow_race "${SPLITS}" $((SPLITS / 8)) 3 2>&1)
 echo "${out}" | grep -E "parent:|child:" | sed 's/^/    /'
 grew=$(grep -c junction-libc /tmp/heap_trace.txt 2>/dev/null); grew=${grew:-0}
 echo "    LibOS heap growth events: ${grew}"
-[ "${grew}" -eq 0 ] && echo "    (reserve absorbed it - see docs/shared-memory-audit.md)"
+echo "    (each one is an arena mapping now, visible to every address space)"
 
 echo
 if [ "${fail}" -eq 0 ]; then

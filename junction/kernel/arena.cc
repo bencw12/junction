@@ -192,7 +192,8 @@ struct ShadowEntry {
   }
 
   bool TryMergeRight(const ShadowEntry &lhs) {
-    if (start_ != lhs.end_ || prot_ != lhs.prot_ || dead_ != lhs.dead_)
+    if (start_ != lhs.end_ || prot_ != lhs.prot_ || dead_ != lhs.dead_ ||
+        moved_ != lhs.moved_)
       return false;
     if (lhs.offset_ + (lhs.end_ - lhs.start_) != offset_) return false;
     start_ = lhs.start_;
@@ -204,7 +205,8 @@ struct ShadowEntry {
   uintptr_t end_;
   uint64_t offset_;  // into the memfd
   int prot_;
-  bool dead_;  // freed and quarantined: never reused, never repaired
+  bool dead_;   // quarantined: never reused, never repaired
+  bool moved_;  // dead because mremap moved it: its offsets live on elsewhere
 };
 
 template <typename T>
@@ -251,6 +253,47 @@ bool RangeIsLive(uintptr_t start, uintptr_t end) {
     cur = e.end_;
   }
   return true;
+}
+
+// Punches the pages of every piece of [start, end) out of the memfd. Caller
+// holds the lock and has checked the range is live. Returns failures.
+size_t PunchLocked(uintptr_t start, uintptr_t end) {
+  size_t failed = 0;
+  uintptr_t cur = start;
+  while (cur < end) {
+    const ShadowEntry &e = arena.va.Find(cur)->get();
+    uintptr_t piece_end = std::min(e.end_, end);
+    uint64_t off = e.offset_ + (cur - e.start_);
+    long ret = ksyscall(SYS_fallocate, arena.fd,
+                        FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, off,
+                        piece_end - cur);
+    if (unlikely(ret < 0)) failed++;
+    cur = piece_end;
+  }
+  return failed;
+}
+
+// Quarantines [start, end) -- marks it dead, puts the reservation back over
+// it here -- optionally punching first. Caller holds the lock and has checked
+// the range is live. Returns punch failures.
+size_t UnmapLocked(uintptr_t start, uintptr_t end, bool punch, bool moved) {
+  size_t failed = punch ? PunchLocked(start, end) : 0;
+  arena.va.Modify(
+      start, end, [](const ShadowEntry &e) { return !e.dead_; },
+      [moved](ShadowEntry &e) {
+        e.dead_ = true;
+        e.moved_ = moved;
+      });
+  // The reservation, not munmap: a hole would be free address space inside
+  // the slot that a foreign mmap(NULL) could land in. Same single syscall.
+  // Other address spaces keep their stale mapping until garbage collection;
+  // it is quarantined, so it cannot be confused with anything live.
+  ksys_mmap(reinterpret_cast<void *>(start), end - start, PROT_NONE,
+            MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED, -1, 0);
+  arena.mapped -= end - start;
+  arena.quarantined += end - start;
+  arena.punch_failures += failed;
+  return failed;
 }
 
 bool ArenaRepair(uintptr_t addr, int required_prot) {
@@ -444,7 +487,7 @@ Status<void *> ArenaMap(size_t len, int prot) {
     ret = ksys_mmap(reinterpret_cast<void *>(va), len, prot,
                     MAP_SHARED | MAP_FIXED, arena.fd, off);
     if (likely(ret >= 0)) {
-      arena.va.Insert(ShadowEntry{va, va + len, off, prot, false});
+      arena.va.Insert(ShadowEntry{va, va + len, off, prot, false, false});
       arena.off.Insert(SimpleInterval{off, off + len});
       arena.mapped += len;
     }
@@ -468,45 +511,14 @@ Status<void> ArenaUnmap(void *addr, size_t len) {
   if (unlikely(start < arena.base || end > arena.base + arena.len))
     return MakeError(EINVAL);
 
-  size_t failed = 0;
+  size_t failed;
   {
     rt::SpinGuard g(arena.lock);
     if (!RangeIsLive(start, end)) return MakeError(EINVAL);
-
-    // Free the physical pages. munmap alone would not: on a shared memfd
-    // mapping neither munmap nor MADV_DONTNEED returns a page, only a hole
-    // punch does (docs/traces/memfd_reclaim.c). Piece by piece, because the
-    // range may span several entries with different offsets.
-    uintptr_t cur = start;
-    while (cur < end) {
-      const ShadowEntry &e = arena.va.Find(cur)->get();
-      uintptr_t piece_end = std::min(e.end_, end);
-      uint64_t off = e.offset_ + (cur - e.start_);
-      long ret = ksyscall(SYS_fallocate, arena.fd,
-                          FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, off,
-                          piece_end - cur);
-      if (unlikely(ret < 0)) failed++;
-      cur = piece_end;
-    }
-
-    // Quarantine: the entries stay, marked dead, so the range and its offsets
-    // are never handed out again. Garbage collection is what will eventually
-    // remove them, after unmapping the range from every address space.
-    arena.va.Modify(
-        start, end, [](const ShadowEntry &e) { return !e.dead_; },
-        [](ShadowEntry &e) { e.dead_ = true; });
-
-    // Put the reservation back over the range, rather than munmap: a hole
-    // would be free address space that a foreign mmap(NULL) could land in,
-    // and the slot is meant to stay ours. Same single syscall either way.
-    // Other address spaces keep their stale mapping over the punched offsets
-    // -- it reads as zeros and the range is quarantined, so it cannot be
-    // confused with anything live -- until garbage collection.
-    ksys_mmap(addr, len, PROT_NONE,
-              MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED, -1, 0);
-    arena.mapped -= len;
-    arena.quarantined += len;
-    arena.punch_failures += failed;
+    // Free the physical pages, then quarantine. munmap alone would not free
+    // anything: on a shared memfd mapping neither munmap nor MADV_DONTNEED
+    // returns a page, only a hole punch does (docs/traces/memfd_reclaim.c).
+    failed = UnmapLocked(start, end, /*punch=*/true, /*moved=*/false);
   }
 
   if (unlikely(failed))
@@ -533,6 +545,206 @@ Status<void> ArenaProtect(void *addr, size_t len, int prot) {
       [prot](const ShadowEntry &e) { return !e.dead_ && e.prot_ != prot; },
       [prot](ShadowEntry &e) { e.prot_ = prot; });
   return {};
+}
+
+Status<void> ArenaDiscard(void *addr, size_t len) {
+  if (unlikely(!arena.ready)) return MakeError(ENODEV);
+  uintptr_t start = reinterpret_cast<uintptr_t>(addr), end = start + len;
+  if (unlikely(!len || start % kPageSize || len % kPageSize))
+    return MakeError(EINVAL);
+  if (unlikely(start < arena.base || end > arena.base + arena.len))
+    return MakeError(EINVAL);
+
+  size_t failed;
+  {
+    rt::SpinGuard g(arena.lock);
+    if (!RangeIsLive(start, end)) return MakeError(EINVAL);
+    failed = PunchLocked(start, end);
+    arena.punch_failures += failed;
+  }
+  if (unlikely(failed))
+    LOG(WARN) << "arena: " << failed << " hole punch(es) failed discarding 0x"
+              << std::hex << start << "-0x" << end << std::dec;
+  return {};
+}
+
+Status<void *> ArenaRemap(void *old, size_t old_len, size_t new_len,
+                          int flags) {
+  if (unlikely(!arena.ready)) return MakeError(ENODEV);
+  uintptr_t start = reinterpret_cast<uintptr_t>(old), end = start + old_len;
+  if (unlikely(!old_len || !new_len || start % kPageSize ||
+               old_len % kPageSize || new_len % kPageSize))
+    return MakeError(EINVAL);
+  if (unlikely(start < arena.base || end > arena.base + arena.len))
+    return MakeError(EINVAL);
+  if (unlikely(flags & MREMAP_FIXED)) return MakeError(EINVAL);
+
+  rt::SpinGuard g(arena.lock);
+  if (!RangeIsLive(start, end)) return MakeError(EINVAL);
+  if (new_len == old_len) return old;
+
+  if (new_len < old_len) {
+    UnmapLocked(start + new_len, end, /*punch=*/true, /*moved=*/false);
+    return old;
+  }
+
+  size_t delta = new_len - old_len;
+  const ShadowEntry &last = arena.va.Find(end - 1)->get();
+  int prot = last.prot_;
+
+  // Grow in place: the addresses past the range are free. Prefer offsets
+  // contiguous with the last piece so the new entry merges into it; any free
+  // offsets will do otherwise -- the range stays contiguous in VA and gets
+  // one more entry, which is the "fragment the offsets" case.
+  if (start + new_len <= arena.base + arena.len &&
+      !arena.va.has_overlap(end, start + new_len)) {
+    uint64_t want = last.offset_ + (end - last.start_);
+    uint64_t off;
+    if (want + delta <= arena.len && !arena.off.has_overlap(want, want + delta)) {
+      off = want;
+    } else {
+      Status<uintptr_t> o = arena.off.FindFreeRange(0, delta, arena.len, 0);
+      if (!o) return MakeError(ENOMEM);
+      off = *o;
+    }
+    intptr_t ret = ksys_mmap(reinterpret_cast<void *>(end), delta, prot,
+                             MAP_SHARED | MAP_FIXED, arena.fd, off);
+    if (unlikely(ret < 0)) return MakeError(static_cast<int>(-ret));
+    arena.va.Insert(ShadowEntry{end, start + new_len, off, prot, false, false});
+    arena.off.Insert(SimpleInterval{off, off + delta});
+    arena.mapped += delta;
+    return old;
+  }
+
+  if (!(flags & MREMAP_MAYMOVE)) return MakeError(ENOMEM);
+
+  // Move. The bytes stay at their offsets; only the address changes. Gather
+  // the pieces first, then map every one at its new place with the same
+  // binding, then the extension, then quarantine the old address -- without
+  // punching, because those offsets are now bound to the new address.
+  struct Piece {
+    uintptr_t start, end;
+    uint64_t off;
+    int prot;
+  };
+  constexpr size_t kMaxPieces = 64;
+  Piece pieces[kMaxPieces];
+  size_t n = 0;
+  for (uintptr_t cur = start; cur < end;) {
+    if (n == kMaxPieces) return MakeError(ENOMEM);
+    const ShadowEntry &e = arena.va.Find(cur)->get();
+    uintptr_t piece_end = std::min(e.end_, end);
+    pieces[n++] = Piece{cur, piece_end, e.offset_ + (cur - e.start_), e.prot_};
+    cur = piece_end;
+  }
+  Status<uintptr_t> v =
+      arena.va.FindFreeRange(0, new_len, arena.base + arena.len, arena.base);
+  if (!v) return MakeError(ENOMEM);
+  Status<uintptr_t> o = arena.off.FindFreeRange(0, delta, arena.len, 0);
+  if (!o) return MakeError(ENOMEM);
+  uintptr_t nva = *v;
+  uint64_t ext_off = *o;
+
+  for (size_t i = 0; i < n; i++) {
+    uintptr_t dst = nva + (pieces[i].start - start);
+    intptr_t ret = ksys_mmap(reinterpret_cast<void *>(dst),
+                             pieces[i].end - pieces[i].start, pieces[i].prot,
+                             MAP_SHARED | MAP_FIXED, arena.fd, pieces[i].off);
+    if (unlikely(ret < 0)) {
+      ksys_mmap(reinterpret_cast<void *>(nva), new_len, PROT_NONE,
+                MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED, -1, 0);
+      return MakeError(static_cast<int>(-ret));
+    }
+  }
+  intptr_t ret = ksys_mmap(reinterpret_cast<void *>(nva + old_len), delta, prot,
+                           MAP_SHARED | MAP_FIXED, arena.fd, ext_off);
+  if (unlikely(ret < 0)) {
+    ksys_mmap(reinterpret_cast<void *>(nva), new_len, PROT_NONE,
+              MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED, -1, 0);
+    return MakeError(static_cast<int>(-ret));
+  }
+
+  for (size_t i = 0; i < n; i++) {
+    uintptr_t dst = nva + (pieces[i].start - start);
+    arena.va.Insert(ShadowEntry{dst, dst + (pieces[i].end - pieces[i].start),
+                                pieces[i].off, pieces[i].prot, false, false});
+  }
+  arena.va.Insert(
+      ShadowEntry{nva + old_len, nva + new_len, ext_off, prot, false, false});
+  arena.off.Insert(SimpleInterval{ext_off, ext_off + delta});
+  arena.mapped += new_len;
+  UnmapLocked(start, end, /*punch=*/false, /*moved=*/true);
+  return reinterpret_cast<void *>(nva);
+}
+
+bool RouteLibOSMemSyscall(long sysn, long a0, long a1, long a2, long a3,
+                          long a4, long a5, long *res) {
+  if (!arena.ready) return false;
+  auto put = [res](auto &&st, long ok) {
+    *res = st ? ok : MakeCError(st);
+    return true;
+  };
+  switch (sysn) {
+    case __NR_mmap: {
+      void *addr = reinterpret_cast<void *>(a0);
+      size_t len = PageAlign(static_cast<size_t>(a1));
+      int prot = static_cast<int>(a2), flags = static_cast<int>(a3);
+      int fd = static_cast<int>(a4);
+      // Only anonymous private memory is the arena's business. A file
+      // mapping (dlopen), shared memory, huge pages: native, as before.
+      if (!(flags & MAP_ANONYMOUS) || fd != -1) return false;
+      if (flags & (MAP_SHARED | MAP_HUGETLB | MAP_GROWSDOWN)) return false;
+      if (!len) {
+        *res = -EINVAL;
+        return true;
+      }
+      if (flags & (MAP_FIXED | MAP_FIXED_NOREPLACE)) {
+        // glibc's shrink_heap does this to its own heap tail: MAP_FIXED
+        // PROT_NONE anonymous over memory it already has. Inside the arena
+        // that means "fresh zeros at this protection" -- the binding must
+        // not change, or every other address space would keep the old one.
+        if (!ArenaContains(reinterpret_cast<uintptr_t>(addr))) return false;
+        Status<void> d = ArenaDiscard(addr, len);
+        if (!d) return put(d, 0);
+        return put(ArenaProtect(addr, len, prot), a0);
+      }
+      Status<void *> r = ArenaMap(len, prot);  // a hint is only a hint
+      return put(r, r ? reinterpret_cast<long>(*r) : 0);
+    }
+    case __NR_munmap:
+      if (!ArenaContains(static_cast<uintptr_t>(a0))) return false;
+      return put(ArenaUnmap(reinterpret_cast<void *>(a0),
+                            PageAlign(static_cast<size_t>(a1))),
+                 0);
+    case __NR_mprotect:
+      if (!ArenaContains(static_cast<uintptr_t>(a0))) return false;
+      return put(ArenaProtect(reinterpret_cast<void *>(a0),
+                              PageAlign(static_cast<size_t>(a1)),
+                              static_cast<int>(a2)),
+                 0);
+    case __NR_madvise: {
+      if (!ArenaContains(static_cast<uintptr_t>(a0))) return false;
+      int advice = static_cast<int>(a2);
+      // "Give these pages back" has to become a punch here; every other
+      // piece of advice is a hint the arena can ignore.
+      if (advice == MADV_DONTNEED || advice == MADV_FREE ||
+          advice == MADV_REMOVE)
+        return put(ArenaDiscard(reinterpret_cast<void *>(a0),
+                                PageAlign(static_cast<size_t>(a1))),
+                   0);
+      *res = 0;
+      return true;
+    }
+    case __NR_mremap: {
+      if (!ArenaContains(static_cast<uintptr_t>(a0))) return false;
+      Status<void *> r = ArenaRemap(
+          reinterpret_cast<void *>(a0), PageAlign(static_cast<size_t>(a1)),
+          PageAlign(static_cast<size_t>(a2)), static_cast<int>(a3));
+      return put(r, r ? reinterpret_cast<long>(*r) : 0);
+    }
+    default:
+      return false;
+  }
 }
 
 bool ArenaContains(uintptr_t addr) {

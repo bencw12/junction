@@ -90,6 +90,28 @@ Status<void> ArenaUnmap(void *addr, size_t len);
 // with the old protection keeps it until an access there faults.
 Status<void> ArenaProtect(void *addr, size_t len, int prot);
 
+// Returns the pages of [addr, addr+len), which must be live arena memory, to
+// the kernel while keeping the mapping and the binding: the range reads as
+// zeros afterwards, here and everywhere. What MADV_DONTNEED means on private
+// anonymous memory, which on a shared memfd mapping it does not do.
+Status<void> ArenaDiscard(void *addr, size_t len);
+
+// mremap for arena memory: [old, old+old_len) must be live. Shrinking frees
+// the tail. Growing extends in place when the addresses after the range are
+// free, else -- with MREMAP_MAYMOVE -- moves the range to a fresh address:
+// the bytes never move, only the virtual address does, because the content
+// lives at a memfd offset that the new address is bound to. The old address
+// is quarantined. MREMAP_FIXED is not supported. Returns the new address.
+Status<void *> ArenaRemap(void *old, size_t old_len, size_t new_len,
+                          int flags);
+
+// The LibOS's own memory syscalls, trapped by seccomp from Junction's glibc.
+// Serves the ones the arena can (anonymous private mmap, and munmap /
+// mprotect / mremap / madvise of arena memory) and stores the syscall's result
+// in *res; returns false for the rest, which the caller executes natively.
+[[nodiscard]] bool RouteLibOSMemSyscall(long sysn, long a0, long a1, long a2,
+                                        long a3, long a4, long a5, long *res);
+
 // Whether @addr is inside the arena's slot at all, and whether it is currently
 // live (mapped, not quarantined). Both for diagnostics and tests.
 [[nodiscard]] bool ArenaContains(uintptr_t addr);

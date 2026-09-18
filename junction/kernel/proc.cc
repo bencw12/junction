@@ -994,7 +994,14 @@ long usys_getpid() {
           };
           hex(lo);
           if (line[j] == '-') { j++; hex(hi); }
-          if (lo && want >= lo && want < hi) { present = true; break; }
+          // Readable, not merely covered: the arena's PROT_NONE reservation
+          // spans its whole slot in every address space, so "some VMA covers
+          // it" is always true there and proves nothing.
+          if (lo && want >= lo && want < hi && line[j] == ' ' &&
+              line[j + 1] == 'r') {
+            present = true;
+            break;
+          }
           n = 0;
         }
       }
@@ -1015,9 +1022,23 @@ long usys_getpid() {
     // own heap would. This is the crash: glibc's free lists are shared LibOS
     // state, so a chunk handed out here is one another address space mapped.
     if (!present) {
-      LOG(INFO) << "debug: writing to it from this address space anyway...";
-      *reinterpret_cast<volatile char *>(pa) = 0x5a;
-      LOG(INFO) << "debug: write succeeded (unexpected)";
+      // Absent from the map is what a lazily repaired arena range looks like
+      // until it is touched. Touch it: the read faults, the fault is repaired
+      // from the shadow map, and the bytes must be the ones the other address
+      // space wrote (0xab) -- that is the proof, not the absence of a crash.
+      LOG(INFO) << "debug: absent from this address space's map; touching it";
+      volatile unsigned char *b = reinterpret_cast<volatile unsigned char *>(pa);
+      unsigned char seen = b[0];
+      b[0] = 0x5a;
+      if (seen == 0xab)
+        LOG(INFO) << "debug: REPAIRED ON TOUCH (read 0xab, written in address "
+                     "space "
+                  << debug_libos_as << ")";
+      else
+        LOG(INFO) << "debug: touch succeeded but read 0x" << std::hex
+                  << static_cast<int>(seen) << std::dec
+                  << ", not the 0xab written in address space "
+                  << debug_libos_as << " -- WRONG BYTES";
     }
     LOG(INFO) << "debug:   control (LibOS text at 0x" << std::hex << control
               << std::dec << ", mapped before the fork): "

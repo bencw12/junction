@@ -403,8 +403,19 @@ child; was 2/5 crashes even after the pool was replaced, until the handler
 change above) and `scripts/pipe_heap_test.sh` (17000 pipes past the old pool;
 was 3/3 crashes).
 
-**3a, Junction half: open.** Everything in an allowlisted window must be edited.
-Verified: the escape probe's `ksys_mmap` succeeded with no SIGSYS event.
+**3a, Junction half: audited, nothing to edit.** Every `ksys_mmap` /
+`KernelMMap*` caller was classified:
+
+| caller | what it maps | verdict |
+| --- | --- | --- |
+| `mm.cc` (5), `linuxfile.cc`, `memfs.cc:199`, `jif.cc` (2) | **guest** memory, per process | per-address-space is correct; not LibOS memory |
+| `zpoline.cc`, `syscall.cc`, `shim/backend/init.cc`, `perf.h` | fixed LibOS mappings at **init** | made before any clone, inherited by all |
+| `memfs.cc:173` | the memfs extent | already a managed slot |
+| `arena.cc`, `memprobe.cc` | ours | know where they map |
+
+So the allowlisted window contains no LibOS mapping made after a clone, and the
+escape probe's finding ("`ksys_mmap` succeeded with no SIGSYS event") is the
+window working as designed for guest memory, not a gap.
 
 - Junction: `mm.cc` (5), `memfs.cc` (3), `jif.cc` (2), `perf.h`,
   `linuxfile.cc`, `zpoline.cc`, `syscall.cc`, `shim/backend/init.cc` — plus
@@ -417,6 +428,36 @@ Verified: the escape probe's `ksys_mmap` succeeded with no SIGSYS event.
   This is the correction to an earlier version of this document, which said
   Caladan reached the kernel through libc `mmap` and would therefore be covered
   by 3b. It is covered by neither until these two call sites are changed.
+
+**3b: done.** `RouteLibOSMemSyscall()` (`arena.cc`) sits in the trap handler's
+libc branch (`seccomp.cc`), before the native fallback. Anonymous private
+`mmap` comes out of the arena; `munmap`, `mprotect`, `mremap` and `madvise` of
+arena memory go back to it; everything the arena declines -- file mappings
+(`dlopen`), shared memory, huge pages -- still runs natively, and the memory
+trace shows which. Two glibc behaviours needed their own translation, as the
+table below predicted: `MADV_DONTNEED` (and `MADV_FREE`) become a hole punch
+with the mapping kept (`ArenaDiscard`), and `shrink_heap`'s `MAP_FIXED
+PROT_NONE` over its own heap tail becomes discard + protect rather than a
+rebinding. `mremap` is implemented for all three cases -- shrink, grow in place
+(offsets contiguous with the last piece when free, so the entry merges; any
+free offsets otherwise), and move with `MREMAP_MAYMOVE` (the bytes never move;
+the old address is quarantined without punching, since its offsets live on at
+the new address -- `moved_` on the entry records that for GC).
+
+This deletes the last pre-reserved pool: the 64 MB pre-grown heap and the
+three `mallopt` calls in `InitAddressSpaces()`, which existed to stop glibc from
+mapping anything after the sweep. glibc may map freely now; it all lands in the
+arena.
+
+Acceptance: `scripts/heap_overflow_test.sh`, which was written to crash. A
+128 MB `malloc` forced under a forked guest's address space lands at
+`0x537f...` -- inside the arena -- and from another address space is *absent
+from the map, repaired on touch, and reads back the bytes the first one wrote*
+(3/3). The probe's presence check had to become permission-aware first: the
+arena's `PROT_NONE` reservation covers its whole slot everywhere, so "some VMA
+covers it" was always true and proved nothing.
+
+The original 3b text, for what it covered:
 
 **3b. Only the libc-routed callers are intercepted**, at the SIGSYS handler:
 
