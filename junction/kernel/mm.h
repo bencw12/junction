@@ -151,6 +151,12 @@ inline std::ostream &operator<<(std::ostream &os,
 }
 
 // MemoryMap manages memory for a process
+// One forked address space and how many memory maps currently live in it.
+struct AddressSpaceRef {
+  uint64_t handle;
+  std::atomic<int> holders;
+};
+
 class alignas(kCacheLineSize) MemoryMap {
  public:
   MemoryMap(void *base, size_t len)
@@ -172,21 +178,16 @@ class alignas(kCacheLineSize) MemoryMap {
   // The address space this memory map's mappings live in.
   [[nodiscard]] uint64_t get_as_handle() const { return as_handle_; }
 
-  // Hands this memory map's address space to @other. Used by exec(), which
-  // replaces a process's mappings but keeps it in the same address space.
-  //
-  // Deliberately leaves owns_as_ alone and sets as_transferred_ instead. The
-  // only thing that must change is that *this* map stops releasing the address
-  // space -- the new image has already been loaded into it. Clearing owns_as_
-  // would additionally divert the destructor onto the unmap path, which tears
-  // down a reservation a forked map shares with its parent and desynchronises
-  // the global region map (MM Panic).
-  void TransferAddressSpaceTo(MemoryMap &other) {
-    other.as_handle_ = as_handle_;
-    other.arena_gc_cursor_ = arena_gc_cursor_;
-    other.owns_as_ = owns_as_;
-    as_transferred_ = true;
-    owns_as_ = false;
+  // Puts this map in @other's address space, as one more holder of it. exec()
+  // uses it: the new image was loaded into whichever address space the caller
+  // is bound to, which is @other's -- the caller's own if it forked, its
+  // parent's if it vforked. Either way both maps now live there, and the space
+  // is released only when the last of its holders is destroyed.
+  void ShareAddressSpaceOf(const MemoryMap &other) {
+    as_handle_ = other.as_handle_;
+    arena_gc_cursor_ = other.arena_gc_cursor_;
+    as_ref_ = other.as_ref_;
+    if (as_ref_) as_ref_->holders.fetch_add(1, std::memory_order_acq_rel);
   }
 
   // The range reserved for this memory map.
@@ -325,6 +326,27 @@ class alignas(kCacheLineSize) MemoryMap {
     mem_areas_.Insert({base, base + len});
   }
 
+  // The LibOS's own fixed pages inside the guest range -- the syscall table
+  // and the vDSO. Registered so no guest is ever placed over them, and marked
+  // so that a clone never excludes them: they must be present in every
+  // address space.
+  static void RegisterLibOSRegion(uintptr_t base, size_t len) {
+    rt::SpinGuard g(mm_lock_);
+    assert(!mem_areas_.has_overlap(base, base + len));
+    mem_areas_.Insert({base, base + len});
+    libos_areas_.Insert({base, base + len});
+  }
+
+  // Every guest range other than @own: every other process's slice, fixed
+  // image or restored map, from the moment it is allocated until its last
+  // mapping is gone. This is what a clone must exclude. It comes from the
+  // registry rather than the process list on purpose: a process that has
+  // exited leaves the list before its memory map's destructor has finished
+  // unmapping its image, and a clone taken in that window would inherit the
+  // image without excluding it -- then, once the slice is freed and handed to
+  // the next exec in that address space, collide with it.
+  static std::vector<AddressRange> GetOtherGuestRegions(AddressRange own);
+
   [[nodiscard]] static size_t get_nr_non_reloc() { return nr_non_reloc_maps_; }
 
   static rt::Spin &global_lock() { return mm_lock_; };
@@ -402,20 +424,18 @@ class alignas(kCacheLineSize) MemoryMap {
   // forked share the address space Junction started in.
   uint64_t as_handle_{kRootAddressSpace};
   uint64_t *arena_gc_cursor_{nullptr};
-  // Whether destroying this memory map should release the address space. The
-  // root address space is never released, and exec() transfers ownership to
-  // the replacement memory map.
-  bool owns_as_{false};
-  // Set when exec() handed this map's address space to its successor.
-  bool as_transferred_{false};
-  // Whether this memory map shares its reserved range with a forked relative,
-  // in which case tearing it down must not unmap anything: the address space
-  // itself is going away, and the range still belongs to the other process.
-  bool shares_reservation_{false};
+  // A forked address space is shared by reference among the processes that
+  // live in it: the one that forked it and everything it vfork+execs, each
+  // holding one reference through its memory map. The map that drops the last
+  // reference releases the space; every other map, on destruction, only
+  // removes its own image from it. Null for the root address space, which is
+  // never released.
+  std::shared_ptr<AddressSpaceRef> as_ref_;
   static rt::Spin mm_lock_;
   static std::atomic_size_t nr_non_reloc_maps_;
   // Tracks all areas allocated in the virtual address space.
   static ExclusiveIntervalSet<SimpleInterval> mem_areas_;
+  static ExclusiveIntervalSet<SimpleInterval> libos_areas_;
 };
 
 }  // namespace junction

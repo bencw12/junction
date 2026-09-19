@@ -535,6 +535,18 @@ size_t ForEachOtherAddressSpace(void (*fn)(uint64_t, void *), void *ctx) {
   return visited;
 }
 
+void DumpMappingsOverlapping(uintptr_t start, uintptr_t end) {
+  if (!maps_ref) return;
+  Status<size_t> n = SnapshotMaps(maps_ref);
+  if (!n) return;
+  for (size_t i = 0; i < *n; i++) {
+    const Mapping &m = maps_ref[i];
+    if (m.end <= start || m.start >= end) continue;
+    log_err("  OVERLAP %lx-%lx prot=%d shared=%d tag='%s'", m.start, m.end,
+            m.prot, m.shared, m.tag);
+  }
+}
+
 int RangeReadableHere(uintptr_t start, uintptr_t end) {
   if (!maps_ref) return -1;
   Status<size_t> n = SnapshotMaps(maps_ref);

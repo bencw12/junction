@@ -58,7 +58,7 @@ Status<void> SyscallInit() {
       KernelMMapFixed(dst_tbl, sizeof(sys_tbl), PROT_READ | PROT_WRITE, 0);
   if (unlikely(!ret)) return ret;
 
-  MemoryMap::RegisterMMRegion(SYSTBL_TRAMPOLINE_LOC, sizeof(sys_tbl));
+  MemoryMap::RegisterLibOSRegion(SYSTBL_TRAMPOLINE_LOC, sizeof(sys_tbl));
 
   if (GetCfg().strace_enabled())
     std::memcpy(sys_tbl, sys_tbl_strace, sizeof(sys_tbl_strace));
@@ -76,7 +76,7 @@ Status<void> SyscallInit() {
                       reinterpret_cast<void *>(kVDSOLocation));
   if (mret == MAP_FAILED) return MakeError(-errno);
 
-  MemoryMap::RegisterMMRegion(kVDSOLocation, vdso_size());
+  MemoryMap::RegisterLibOSRegion(kVDSOLocation, vdso_size());
   return {};
 }
 

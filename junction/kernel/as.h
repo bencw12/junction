@@ -134,4 +134,8 @@ size_t ForEachOtherAddressSpace(void (*fn)(uint64_t handle, void *ctx),
 // ForEachOtherAddressSpace() visit, which holds that scratch's lock.
 [[nodiscard]] int RangeReadableHere(uintptr_t start, uintptr_t end);
 
+// Logs every mapping of the current address space that overlaps [start, end).
+// Diagnostic for MM Panic: says what is really there.
+void DumpMappingsOverlapping(uintptr_t start, uintptr_t end);
+
 }  // namespace junction

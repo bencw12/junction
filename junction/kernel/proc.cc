@@ -434,18 +434,15 @@ Status<std::shared_ptr<Process>> Process::CreateProcessFork(
   if (!pid) return MakeError(pid);
 
   // Every other guest's memory must stay out of the child's address space.
-  // Only other processes' memory maps qualify: the global region table also
-  // holds ranges the LibOS registered for itself, and those have to be present
-  // in every address space.
-  AddressRange own = mem_map_->get_reservation();
-  std::vector<AddressRange> exclude;
-  ForEachProcess([&](Process &p) {
-    AddressRange r = p.get_mem_map().get_reservation();
-    if (r.start == own.start) return;  // ours, or a vfork child sharing it
-    for (const AddressRange &e : exclude)
-      if (e.start == r.start) return;
-    exclude.push_back(r);
-  });
+  // Taken from the region registry, not from the process list: a process that
+  // has exited is gone from the list before its memory map has finished
+  // unmapping its image, and a clone in that window used to inherit the image
+  // -- unexcluded, and about to be handed out again. The registry keeps a
+  // range until its last mapping is gone, and knows which ranges are the
+  // LibOS's own (present everywhere, never excluded). Our own range -- also a
+  // vfork child's, which shares it -- is cut out.
+  std::vector<AddressRange> exclude =
+      MemoryMap::GetOtherGuestRegions(mem_map_->get_reservation());
 
   // CLONE_CHILD_SETTID asks for the child's tid to be stored in the child's
   // memory. The child's memory does not exist yet, and once it does it is not

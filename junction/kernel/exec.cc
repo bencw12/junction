@@ -347,17 +347,17 @@ long DoExecve(std::shared_ptr<DirectoryEntry> dent, const char *filename,
 
     // exec replaces a process's mappings but leaves it in the same address
     // space: the new image was just loaded into whichever address space this
-    // core is bound to, which is the caller's. Without this the new MemoryMap
-    // keeps the default handle (kRootAddressSpace), so the next time the
-    // thread is scheduled the core binds the *root* address space and
-    // jmp_thread_direct restores its context from memory that only exists in
-    // the caller's -- a fault at the moment of the switch, with no frame to
-    // report it from.
+    // core is bound to, which is the caller's -- its own if it forked, its
+    // parent's if it vforked. Without this the new MemoryMap keeps the default
+    // handle (kRootAddressSpace), so the next time the thread is scheduled the
+    // core binds the *root* address space and jmp_thread_direct restores its
+    // context from memory that only exists in the caller's -- a fault at the
+    // moment of the switch, with no frame to report it from. (`sleep 1 &` is
+    // enough to show it; see docs/bug-exec-timer-address-space.md.)
     //
-    // Only shows up once the process is descheduled and resumed, so it needs
-    // a second runnable process and something to wake up for. `sleep 1 &` is
-    // enough. See docs/bug-exec-timer-address-space.md.
-    old_mm.TransferAddressSpaceTo(**mm);
+    // The new map becomes one more holder of that space, not its owner: a
+    // vfork child's parent is still living there.
+    (*mm)->ShareAddressSpaceOf(old_mm);
 
     // Dropping the old map unmaps the old image, and %fs still points into it:
     // a guest syscall runs on the guest's TCB, so any LibOS code that touches

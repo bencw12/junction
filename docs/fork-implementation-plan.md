@@ -852,6 +852,129 @@ Two measurements still say the whole thing is close to free: **LibOS allocation
 events after init are 0** across all five traced workloads, and `max_map_count`
 here is 16777216 against 102 live mappings.
 
+## Real applications (`scripts/app_test.sh`)
+
+Everything above tested the mechanism with a program written to reach one
+path. This runs ordinary software that forks the way software does -- shells
+spawning pipelines and subshells, Python's `multiprocessing` (fork start
+method) and `subprocess`, `make -j`, `git` -- natively and under Junction, and
+requires the output to match. A subset also runs under `--debug_as_audit`.
+
+**Passing:** the `sh` and `bash` loops (240 backgrounded subshell pipelines,
+16 in flight), `multiprocessing.Pool(8)` five times over 2000 tasks (output
+identical to native), `subprocess.run` x150, `git log`, and 30 s of worker
+pools created and torn down (9/9 standalone runs) -- with the audit finding no
+divergence on any of them.
+
+**What it found, in order of what it means:**
+
+1. **A real MAS-exposed bug, fixed.** `poll()`'s per-fd trigger wrote `revents`
+   straight into the poller's guest `pollfd` array -- on the *waker's* thread,
+   which under MAS may be another process bound to another address space where
+   that memory does not exist (`MADV_DONTFORK`). Deterministic crash in
+   `subprocess.run`. Now the trigger records into a LibOS-side buffer and the
+   poller copies back in its own address space, as `select` already did. The
+   rule: LibOS code touches a guest's memory only on that guest's own threads;
+   wakers communicate through LibOS memory. Every other callback site was
+   checked; this was the only one. Switching the waker's mm would have been the
+   wrong fix -- an ioctl per wakeup, and a thread running in a foreign address
+   space with preemption disabled.
+2. **An audit false positive under concurrency, fixed.** The coherence audit
+   classified "LibOS mapping" by the current process's regions, so another live
+   guest's memory -- correctly absent from every clone but its own -- was
+   reported as a failed propagation. It classifies by the partition now.
+3. **A pre-existing syscall-number collision, root-caused, not yet fixed.**
+   `cp -r` dies deterministically. Junction uses syscall-table slots 452-455 for
+   its own entry trampolines (`systbl.py`, and `JUNCTION_ENTRY_*` in the guest
+   glibc's `sysdep.h`), chosen in mid-2023 when Linux stopped at 451. Linux 6.6
+   made 452 `fchmodat2`, and coreutils 9.4's `cp -r` calls it once per
+   directory. The call dispatches into the entry trampoline as if it were a
+   handler, which re-reads a stale value as the syscall number and transforms it
+   again -- the fault at `0x1207100` is `(0x200E20 << 3) + 0x200000`, and
+   `0x200E20` is `&table[452]`. Nothing to do with address spaces; it blocks
+   `make` only because the test copied its inputs with `cp -r`. The fix is to
+   move the entry slots out of the Linux number range on both sides -- Junction's
+   `systbl.py`/`syscall.cc` and the guest glibc's `sysdep.h` -- and give 452 a
+   real `fchmodat2`. The glibc half is in `lib/glibc`, which has uncommitted
+   work of its own, so it is not done here without a decision.
+4. **A pre-existing `wait4` semantics bug, fixed.** With `WNOHANG` and children
+   that exist but are not yet ready, `DoWait` returned `EAGAIN`; Linux returns
+   0 (`ECHILD` only when there are no children at all). GNU `make -jN` polls
+   with `WNOHANG` and treats `EAGAIN` as fatal ("wait: Resource temporarily
+   unavailable"), so every parallel make died and `-j1` -- a blocking wait --
+   passed, which is exactly the threshold measured. One line, unambiguous
+   semantics, in the wait path this work lives in.
+5. **A pre-existing `pselect6` ABI bug, fixed.** The syscall's sixth argument
+   is a pointer to `{const sigset_t *ss; size_t ss_len;}` -- Linux packs it
+   because `pselect6` has run out of registers -- and glibc builds exactly
+   that. Junction read a `sigset_t` there, so the *address* of the mask was
+   used as the mask: which signals were blocked during the wait depended on
+   the stack layout. GNU make's jobserver wait is `pselect` with SIGCHLD
+   unblocked; its argpack landed on an address with bit 16 set, so SIGCHLD was
+   blocked for the wait, and `make -jN` slept forever after its last child
+   exited (visible only once the `WNOHANG` bug above stopped killing it
+   first). Found by the trace: the decoded mask contained `SIGKILL` and
+   `SIGSTOP`, which nothing can block. `ppoll` passes its set directly and
+   was never affected.
+6. **A pre-existing restart-semantics bug, fixed -- and the one that actually
+   hung `make -jN`.** Once the two bugs above were out of the way, `make -j2`
+   still slept forever, and every hypothesis about *why* the wakeup was lost
+   (zombie-before-SIGCHLD ordering, the `pselect` mask swap, a stale
+   `notified_`, inherited pending signals) was tested and refuted -- the
+   instrumented run showed every SIGCHLD to `make` was enqueued, passed the
+   thread check, and sent its IPI. The trace then showed the real sequence:
+   `pselect6` → SIGCHLD handler runs → `rt_sigreturn` → `pselect6` again with
+   identical arguments, and no `wait4` in between. Junction **restarted the
+   syscall after the handler** because the handler had `SA_RESTART` (glibc's
+   `signal()` default). Linux never restarts `select`/`pselect`/`poll`/`ppoll`/
+   `epoll_wait` once a handler has run (`signal(7)`), and `make`'s loop is
+   exactly "pselect until SIGCHLD, then reap". `DoPoll`, `DoSelect` and epoll's
+   `Wait` returned `-ERESTARTSYS`; they now return `-ERESTARTNOHAND`, which the
+   existing restart logic turns into `EINTR` when a handler ran and a
+   transparent restart when none did -- Linux's rule.
+7. **Two bugs in this branch's own address-space bookkeeping, fixed -- and the
+   second is the one behind `make -j6` and up.** With the restart bug gone,
+   `-j2/-j4` passed and `-j6/-j8` died with `mm: Create wanted 0x4fd... got 0`
+   / `MM Panic`: an exec's fresh guest slice, free in the global registry, was
+   already mapped in the exec'ing process's address space. Two theories were
+   tried and refuted by the test before the mechanism was *measured*, with a
+   log of every slice map/unmap, every clone and every exec, plus a dump of
+   what was really mapped at the colliding range:
+
+   - **The collision.** The fork exclusion list (`MADV_DONTFORK`) was built by
+     walking *live processes*. A process that has exited leaves that walk
+     before its `MemoryMap` destructor has finished unmapping its image. The
+     trace: `make` reaps pid 5 at 0.042989 (teardown begins); pid 12 forks at
+     0.042999 -- pid 5 is no longer a process, so its slice is not excluded --
+     and the clone copies pid 5's still-mapped image; the slice is then freed
+     and handed to pid 19's exec in that clone, `EEXIST`. The list is now built
+     from the region **registry**, which holds a range from allocation until
+     *after* its unmap completes, minus the forker's own range and minus the
+     LibOS's fixed pages (syscall table, vDSO -- registered separately now, so
+     they are never excluded). Adjacent slices merge in the registry, so the
+     cut is done per interval rather than by comparison.
+   - **Ownership on vfork+exec.** `exec` called `TransferAddressSpaceTo`
+     unconditionally, including for a vfork child whose `old_mm` is its
+     *parent's*, so in a forked address space a vfork+exec'd pipeline member
+     came to *own* the space: on exit it released it under the still-running
+     shell and skipped unmapping its image. The owner bit is replaced by a
+     **reference count** shared by every map living in a forked space -- the
+     forker's and each vfork+exec'd child's -- released by the last holder,
+     while every other map removes only its own image. Real, and it also let
+     a vfork child's exit forget the parent's arena GC cursor slot; but it was
+     not the collision, which is why fixing it alone still failed 6/6.
+
+   Neither is pre-existing: both are in the address-space implementation this
+   branch added, reachable only by fork-and-exec-heavy programs at
+   concurrency. `make -j6`/`-j8` now pass 6/6 with native's answer.
+8. **Pre-existing limits, pinned:** one non-relocatable binary at a time
+   (`cc1` is one, so `make -j` cannot drive gcc; per-process address spaces are
+   what could lift this); and a per-process thread limit a guest hits at 1023.
+
+Large pages are hugetlb-backed again (`739cdfc`): the region had quietly
+changed them to 4 KB shmem pages, found because hugetlb pages are invisible to
+RSS -- which is also why the "RSS high-water mark" was never the pools' doing.
+
 ## What needs no work
 
 - **directpath.** Two mappings, both `MAP_SHARED`, both in `mlx5_init_ext_late`,

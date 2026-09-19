@@ -23,6 +23,7 @@ extern "C" {
 #include "junction/kernel/as.h"
 #include "junction/kernel/memtrace.h"
 #include "junction/kernel/arena.h"
+#include "junction/kernel/as.h"
 #include "junction/kernel/mm.h"
 #include "junction/kernel/proc.h"
 #include "junction/kernel/usys.h"
@@ -43,6 +44,7 @@ std::map<uintptr_t, unsigned int> mm_region_refs;
 // reservation for each memory map as well as memory areas allocated outside of
 // these regions.
 ExclusiveIntervalSet<SimpleInterval> MemoryMap::mem_areas_;
+ExclusiveIntervalSet<SimpleInterval> MemoryMap::libos_areas_;
 
 std::atomic_size_t MemoryMap::nr_non_reloc_maps_{0};
 
@@ -174,6 +176,33 @@ std::vector<AddressRange> MemoryMap::GetReservedRegions() {
   return out;
 }
 
+std::vector<AddressRange> MemoryMap::GetOtherGuestRegions(AddressRange own) {
+  std::vector<AddressRange> out;
+  rt::SpinGuard g(mm_lock_);
+  for (auto const &[end, iv] : mem_areas_) {
+    // Adjacent slices merge into one interval here, so @own and the LibOS
+    // pages have to be cut out of it rather than compared against it.
+    std::vector<AddressRange> pieces{{iv.get_start(), iv.get_end()}};
+    auto cut = [&pieces](uintptr_t cs, uintptr_t ce) {
+      std::vector<AddressRange> next;
+      for (const AddressRange &r : pieces) {
+        if (ce <= r.start || cs >= r.end) {
+          next.push_back(r);
+          continue;
+        }
+        if (r.start < cs) next.push_back({r.start, cs});
+        if (ce < r.end) next.push_back({ce, r.end});
+      }
+      pieces = std::move(next);
+    };
+    cut(own.start, own.end);
+    for (auto const &[lend, liv] : libos_areas_)
+      cut(liv.get_start(), liv.get_end());
+    out.insert(out.end(), pieces.begin(), pieces.end());
+  }
+  return out;
+}
+
 std::shared_ptr<MemoryMap> MemoryMap::Fork(MemoryMap &parent,
                                            uint64_t as_handle) {
   rt::ScopedSharedLock lock(parent.mu_);
@@ -184,8 +213,9 @@ std::shared_ptr<MemoryMap> MemoryMap::Fork(MemoryMap &parent,
   // The slot was created with the address space (CloneCurrentAddressSpace);
   // this is a lookup. Seeding 0 if it were somehow missing is the safe side.
   mm->arena_gc_cursor_ = ArenaGcSlot(as_handle, 0);
-  mm->owns_as_ = true;
-  mm->shares_reservation_ = true;
+  mm->as_ref_ = std::make_shared<AddressSpaceRef>();
+  mm->as_ref_->handle = as_handle;
+  mm->as_ref_->holders.store(1, std::memory_order_relaxed);
   mm->brk_addr_ = parent.brk_addr_;
   mm->binary_path_ = parent.binary_path_;
   mm->cmd_line_ = parent.cmd_line_;
@@ -213,7 +243,10 @@ Status<std::shared_ptr<MemoryMap>> MemoryMap::Create(size_t len) {
     LOG(ERR) << "mm: Create wanted 0x" << std::hex << *base << "-0x"
              << (*base + len) << " got "
              << (ret ? reinterpret_cast<uintptr_t>(*ret) : 0) << std::dec
-             << " in as=" << GetActiveAddressSpace();
+             << " in as=" << GetActiveAddressSpace() << " pid="
+             << (IsJunctionThread() ? myproc().get_pid() : -1)
+             << " err=" << (ret ? 0 : ret.error().code());
+    DumpMappingsOverlapping(*base, *base + len);
     if (*ret != reinterpret_cast<void *>(*base)) MMPanic(nullptr, mem_areas_);
     MemoryMap::FreeMMRegion(*base, *base + len);
     return MakeError(ret);
@@ -254,28 +287,30 @@ MemoryMap::~MemoryMap() {
   if (is_non_reloc_) nr_non_reloc_maps_--;
   if (is_fake_map_) return;
 
-  if (owns_as_) {
-    // The whole address space is going away, so there is nothing to unmap:
-    // Linux tears down every mapping when the last reference to the address
-    // space is dropped. Unmapping here would be wrong as well as wasteful,
-    // because these addresses are also in use by the process we forked from.
-    //
-    // Unless exec() handed the address space to a successor map, in which case
-    // the new image is already living in it and releasing it would pull the
-    // ground out from under the process.
-    if (!as_transferred_) {
-      // Do not leave this core bound to an address space that is going away.
-      // Whatever runs next on it -- in particular MemoryMap::Create, whose
-      // MAP_FIXED_NOREPLACE would land in the dead process's still-loaded mm
-      // and collide with its stale mappings -- must be looking at a live one.
-      if (GetActiveAddressSpace() == as_handle_)
-        ActivateAddressSpace(kRootAddressSpace);
-      ReleaseAddressSpace(as_handle_);
-    }
+  // The last holder of a forked address space: the whole space is going away,
+  // and Linux tears down every mapping with it, so there is nothing to unmap.
+  // Do not leave this core bound to it -- whatever runs next here, in
+  // particular MemoryMap::Create's MAP_FIXED_NOREPLACE, must be looking at a
+  // live address space, not a dead one's still-loaded mappings.
+  if (as_ref_ &&
+      as_ref_->holders.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+    if (GetActiveAddressSpace() == as_handle_)
+      ActivateAddressSpace(kRootAddressSpace);
+    ReleaseAddressSpace(as_handle_);
     MemoryMap::FreeMMRegion(mm_start_, mm_end_);
     return;
   }
 
+  // The address space lives on: it is the root's, or other maps still hold it
+  // -- the successor after our own exec, the parent after a vfork child's
+  // exec, the vfork children after the parent's exit. Our image has to be
+  // removed from it, or it outlives this slice's registration and collides
+  // with the next process handed these addresses ("mm: Create wanted ... got
+  // 0"). Seen under make -j6: a forked shell's pipeline children, vfork+exec'd
+  // into the shell's address space, used to inherit ownership of it, so the
+  // first to exit released the space under the shell and left its image
+  // behind.
+  //
   // Unmapping acts on whichever address space this core is bound to, so make
   // sure that is the one these mappings actually live in.
   //
