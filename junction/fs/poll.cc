@@ -117,10 +117,14 @@ int DoPoll(pollfd *fds, nfds_t nfds, std::optional<Duration> timeout,
   for (nfds_t i = 0; i < nfds; i++) fds[i].revents = revents[i];
 
   if (nevents == 0 && signaled) {
-    // Restart the syscall if the timer doesn't need to be adjusted
-    // TODO(jfried): support restarting syscalls with parameters that need to be
-    // fixed before restarting.
-    return timeout ? -EINTR : -ERESTARTSYS;
+    // Never restarted once a signal handler has run -- Linux exempts
+    // select/pselect/poll/ppoll/epoll_wait from SA_RESTART (signal(7)), and
+    // programs depend on the EINTR: GNU make's jobserver wait is exactly
+    // "pselect until SIGCHLD, then reap", and an SA_RESTART handler (glibc's
+    // signal() default) put it straight back to sleep. ERESTARTNOHAND is
+    // that rule: restart transparently only if no handler ran. With a timeout
+    // the remaining time would need adjusting, so plain EINTR.
+    return timeout ? -EINTR : -ERESTARTNOHAND;
   }
   return nevents;
 }
@@ -279,7 +283,7 @@ std::pair<int, Duration> DoSelect(
   Duration d(0);
   if (timeout) d = timed_out.TimeLeft();
   if (nevents == 0 && signaled)
-    return std::make_pair(timeout ? -EINTR : -ERESTARTSYS, d);
+    return std::make_pair(timeout ? -EINTR : -ERESTARTNOHAND, d);
   int ret = EncodeSelectFDs(sfds, readfds, writefds, exceptfds);
   return std::make_pair(ret, d);
 }
@@ -482,7 +486,7 @@ int EPollFile::Wait(std::span<epoll_event> events_out,
     if (!events_.empty()) return DeliverEvents(events_out);
   }
 
-  if (signaled) return timeout ? -EINTR : -ERESTARTSYS;
+  if (signaled) return timeout ? -EINTR : -ERESTARTNOHAND;
   return 0;
 }
 
@@ -576,11 +580,31 @@ long usys_select(int nfds, fd_set *readfds, fd_set *writefds, fd_set *exceptfds,
   return ret;
 }
 
+// pselect6's sixth argument is not the signal set. The Linux ABI packs it:
+// a pointer to {const sigset_t *ss; size_t ss_len;}, because the syscall has
+// run out of argument registers. glibc builds exactly that. Reading a sigset
+// here instead used the *address* of the mask as the mask -- so which signals
+// were blocked during the wait depended on the stack layout, and GNU make's
+// jobserver wait (pselect with SIGCHLD unblocked, on every -jN build) landed
+// on an address with bit 16 set, blocked SIGCHLD, and slept forever.
+struct sigset_argpack {
+  const sigset_t *ss;
+  size_t ss_len;
+};
+
 long usys_pselect6(int nfds, fd_set *readfds, fd_set *writefds,
                    fd_set *exceptfds, struct timespec *ts,
-                   const sigset_t *sigmask) {
+                   const sigset_t *sigmask_argpack) {
+  // Declared as sigset_t* to match the generated syscall table; see above for
+  // what actually arrives.
+  const auto *sig = reinterpret_cast<const sigset_argpack *>(sigmask_argpack);
   std::optional<Duration> d;
   if (ts) d = Duration(*ts);
+  const sigset_t *sigmask = nullptr;
+  if (sig && sig->ss) {
+    if (unlikely(sig->ss_len != sizeof(k_sigset_t))) return -EINVAL;
+    sigmask = sig->ss;
+  }
   auto [ret, left] =
       DoSelect(nfds, readfds, writefds, exceptfds, d, KernelSigset(sigmask));
   if (ret >= 0 && ts) *ts = left.Timespec();

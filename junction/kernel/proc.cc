@@ -697,7 +697,11 @@ Status<pid_t> Process::DoWait(idtype_t idtype, id_t id, int options,
   } else {
     tmp = FindWaitableProcess(idtype, id, wait_state_flags);
     if (!tmp) return MakeError(tmp);
-    if (!*tmp) return MakeError(EAGAIN);
+    // Children exist but none is ready: WNOHANG reports that as 0, not an
+    // error. Linux never returns EAGAIN from wait4; GNU make polls with
+    // WNOHANG and treats EAGAIN as fatal ("wait: Resource temporarily
+    // unavailable"), so every parallel make died here.
+    if (!*tmp) return 0;
   }
 
   Process *p = *tmp;
