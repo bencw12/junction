@@ -1028,6 +1028,34 @@ RSS -- which is also why the "RSS high-water mark" was never the pools' doing.
 - **Page-table / maple-tree sharing.** Rejected on constraint 1. The kernel
   module stays switch-only, and `enable_pgtable_sharing` stays off.
 
+## Still open (TODO)
+
+Not MAS bugs; recorded so they are not rediscovered.
+
+- **TODO(snapshot): snapshot/restore under MAS is untested.** Nothing in this
+  branch has been snapshotted: not a forked address space, not the arena's
+  shadow map, not an open FIFO (whose save/load code exists and mirrors
+  `MemIDevice`/`PipeReaderFile`, but has never run). `snapshot_test.sh` cannot
+  be run passively because it restarts the iokernel, so this needs a dedicated
+  session.
+- **One non-relocatable (`ET_EXEC`) binary at a time.** Pre-existing:
+  `MemoryMap::nr_non_reloc_maps_` is a global count and `CheckELFLoad` refuses
+  a second one, because in the single shared address space two fixed-address
+  images would want the same virtual range (`0x400000`). Ubuntu's `gcc`
+  *driver* is `ET_EXEC` as well as `cc1`, so even one `cc -c f.c` fails while
+  the driver is alive. Per-process address spaces remove the reason: a forked
+  process could map its own `0x400000`. Lifting it means dropping the global
+  count for non-root address spaces and giving the fixed-address image the
+  same registry treatment a slice gets, so clones of *other* processes exclude
+  it. Not attempted.
+- **A guest hits a per-process thread limit at 1023.** Observed only.
+- **`--strace` crashes formatting `fstat`.** Observed only, pre-existing.
+- **The pre-existing double-ready** (`deliver_interrupt` readies without
+  unlinking from the `WaitQueue`), intermittent under fork storms; every
+  point fix tried was rejected by the 40-60-run test. Documented in
+  `docs/bug-fork-storm-hang.md`.
+- **No long soak.** The longest run is 30 s of pool churn.
+
 ## Verification gates
 
 - `scripts/vm_test.sh` **must pass for the exact build before any `insmod`** —

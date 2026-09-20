@@ -86,6 +86,11 @@ class MemIFifo : public Inode {
   [[nodiscard]] FifoPipe &pipe() { return *pipe_; }
 
   // Adopt counts a file whose open already happened (snapshot restore).
+  //
+  // TODO(snapshot): the save/load paths below (and FifoFile's) compile and
+  // mirror MemIDevice/PipeReaderFile, but no snapshot of an open FIFO has been
+  // taken and restored yet. Untested claims: readers_/writers_ rebuilt to the
+  // saved channel's closed flags; a waiter parked in Open() across a snapshot.
   void Adopt(FifoFile &f) {
     {
       rt::SpinGuard g(lock_);
