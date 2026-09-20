@@ -76,7 +76,7 @@ uint64_t RewindIndirectSystemCall(uint64_t rip) {
   static const uint8_t imm[] = {0xff, 0x14, 0x25};
   const uint8_t *insns = reinterpret_cast<uint8_t *>(rip);
 
-  // call *(imm): ff 14 25 28 0e 20 00    call   *0x200e28
+  // call *(imm): ff 14 25 e8 0f 20 00    call   *0x200fe8
   // call *(rax):                ff d0    call   *%rax
 
   static_assert(SYSTBL_TRAMPOLINE_LOC >> 16 == 0x20);

@@ -18,7 +18,7 @@ __vdso_\name:
 	.cfi_startproc
 	pushq $\number
 	.cfi_adjust_cfa_offset 8;
-	callq *0x200e28
+	callq *0x200fe8   /* junction_fncall_enter: slot 509 of the syscall table */
 	popq %rcx
 	.cfi_adjust_cfa_offset -8;
 	ret

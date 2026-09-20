@@ -64,8 +64,9 @@ Status<void> SyscallInit() {
     std::memcpy(sys_tbl, sys_tbl_strace, sizeof(sys_tbl_strace));
 
   if (GetCfg().stack_switch_enabled()) {
-    sys_tbl[453] = sys_tbl[451];
-    sys_tbl[454] = sys_tbl[452];
+    // Point the non-stack-switching entries at the stack-switching ones.
+    sys_tbl[SYSTBL_TRAMPOLINE_FIRST + 2] = sys_tbl[SYSTBL_TRAMPOLINE_FIRST];
+    sys_tbl[SYSTBL_TRAMPOLINE_FIRST + 3] = sys_tbl[SYSTBL_TRAMPOLINE_FIRST + 1];
   }
 
   std::memcpy(dst_tbl, sys_tbl, sizeof(sys_tbl));

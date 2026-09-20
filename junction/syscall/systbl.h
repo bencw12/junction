@@ -7,7 +7,17 @@
 #include "junction/kernel/ksys.h"
 #include "junction/kernel/usys.h"
 
-#define SYS_NR 456
+// The syscall table has one slot per Linux syscall number plus a handful of
+// slots that hold Junction's own entry trampolines. Linux numbers end in the
+// 460s today (fchmodat2 is 452, map_shadow_stack 453) and grow by a few per
+// release, so the trampolines live at the top of a 512-slot table: 507-511,
+// well clear of anything Linux will assign soon. 512 slots of 8 bytes is
+// exactly one page at SYSTBL_TRAMPOLINE_LOC. The guest glibc hardcodes the
+// trampoline addresses (JUNCTION_ENTRY_* in sysdeps/unix/sysv/linux/x86_64/
+// sysdep.h, patch 0005), as does the vdso (syscall/vdso/vdso.S); the three must
+// agree.
+#define SYS_NR 512
+#define SYSTBL_TRAMPOLINE_FIRST 507
 #define SYSTBL_TRAMPOLINE_LOC (0x200000UL)
 
 namespace junction {

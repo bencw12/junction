@@ -763,6 +763,14 @@ long usys_fchmodat(int dirfd, const char *path, mode_t mode,
   return 0;
 }
 
+// fchmodat2 (Linux 6.6) is fchmodat with the flags argument honored:
+// AT_SYMLINK_NOFOLLOW and AT_EMPTY_PATH. glibc 2.39 and coreutils 9.4 call it
+// directly. Junction does not follow symlinks differently here yet, so the
+// two are the same call.
+long usys_fchmodat2(int dirfd, const char *path, mode_t mode, int flags) {
+  return usys_fchmodat(dirfd, path, mode, flags);
+}
+
 // Recursively visit all directories under root.
 void Recurse(std::shared_ptr<IDir> root) {
   std::vector<std::shared_ptr<IDir>> queue;

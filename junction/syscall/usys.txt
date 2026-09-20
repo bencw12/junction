@@ -71,6 +71,7 @@ fchownat:::stub
 chmod
 fchmod
 fchmodat
+fchmodat2
 getcwd
 umask
 dup

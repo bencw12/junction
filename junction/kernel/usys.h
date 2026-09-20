@@ -98,6 +98,7 @@ ssize_t usys_readlinkat(int dirfd, const char *pathname, char *buf,
 long usys_chmod(const char *path, mode_t mode);
 long usys_fchmod(int fd, mode_t mode);
 long usys_fchmodat(int dirfd, const char *path, mode_t mode, int flags);
+long usys_fchmodat2(int dirfd, const char *path, mode_t mode, int flags);
 
 long usys_inotify_init();
 long usys_inotify_init1(int flags);

@@ -35,12 +35,12 @@ make -j "$(nproc)" CFLAGS="-U_FORTIFY_SOURCE -O3"
 
 ##
 ## glibc may emit two sets of indirect call instructions for calling into Junction.
-## One is of the form "mov 0x200e28,%rax; call %rax", the other "call   *0x200e28".
+## One is of the form "mov 0x200fe8,%rax; call %rax", the other "call   *0x200fe8".
 ## Both are safe, but the former produces problems when snapshotting with ASLR enabled.
 ## Check the binary for the former and reject the build if it uses it.
 ##
 
-(objdump -S  ${GLIBC_DIR}/build/libc.so.6 |& grep -e 0x200e20 -e 0x200e28 -e 0x200e30 | grep -q -v call) && (echo -e "\033[0;31m Bad instruction sequence in libc binary \033[0m"; exit -1)
+(objdump -S  ${GLIBC_DIR}/build/libc.so.6 |& grep -e 0x200fe0 -e 0x200fe8 -e 0x200ff0 | grep -q -v call) && (echo -e "\033[0;31m Bad instruction sequence in libc binary \033[0m"; exit -1)
 
 make install -j "$(nproc)"
 

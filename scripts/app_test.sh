@@ -185,23 +185,18 @@ echo "------------------------------------------------------------"
 echo "toolchains: make -j8 driving cc, and git"
 echo "------------------------------------------------------------"
 rm -rf "${NATIVE_TMP}/mk" && cp -r "${APP}/mk" "${NATIVE_TMP}/mk"
-# Inputs are copied file by file, not with cp -r: cp -r calls fchmodat2 (see the
-# pinned case below), and this case is about make.
+# Inputs are copied file by file so this case is about make alone; cp -r has
+# its own case next.
 compare "make -j8: 25 targets, each a forked shell" make \
         /bin/sh -c "make -s -C ${NATIVE_TMP}/mk -j8" -- -- \
         /bin/sh -c "rm -rf /tmp/mk && mkdir /tmp/mk && cp ${APP}/mk/* /tmp/mk/ && make -s -C /tmp/mk -j8"
-# Known bug, pinned: Junction's entry trampolines occupy syscall-table slots
-# 452-455, and Linux 6.6 made 452 fchmodat2, which coreutils 9.4's cp -r calls
-# once per directory. The call lands in the trampoline instead of a handler.
-kout=$(junction -- /bin/sh -c "rm -rf /tmp/cpr && cp -r ${APP}/mk /tmp/cpr && echo CPR_OK")
-if echo "${kout}" | grep -q "CPR_OK"; then
-    printf "  %-52s PASS  (fchmodat2 works: unpin this)\n" "cp -r (calls fchmodat2, syscall 452)"
-elif echo "${kout}" | grep -q "segfault in syscall handler: addr=1207100"; then
-    printf "  %-52s KNOWN BUG (452 is an entry-trampoline slot)\n" "cp -r (calls fchmodat2, syscall 452)"
-else
-    printf "  %-52s FAIL (neither worked nor the known signature)\n" "cp -r (calls fchmodat2, syscall 452)"
-    echo "${kout}" | grep -vE "^\[|^CPU" | tail -2 | sed 's/^/        /'; fail=1
-fi
+# coreutils 9.4's cp -r calls fchmodat2 (Linux 6.6, syscall 452) once per
+# directory. Until the entry trampolines moved to the top of the table (slots
+# 507-511, see junction/syscall/systbl.h) 452 was a trampoline slot and the call
+# landed in it instead of a handler. Compare the copied tree with native's.
+compare "cp -r (calls fchmodat2, syscall 452)" cpr \
+        /bin/sh -c "rm -rf ${NATIVE_TMP}/cpr && cp -r ${APP}/mk ${NATIVE_TMP}/cpr && cd ${NATIVE_TMP}/cpr && echo cpr: \$(ls | wc -l) files \$(cat * | md5sum | cut -c1-12)" -- -- \
+        /bin/sh -c "rm -rf /tmp/cpr && cp -r ${APP}/mk /tmp/cpr && cd /tmp/cpr && echo cpr: \$(ls | wc -l) files \$(cat * | md5sum | cut -c1-12)"
 # Known limit, pinned: one non-relocatable binary at a time.
 kout=$(junction -- /bin/sh -c "rm -rf /tmp/cc1 && mkdir /tmp/cc1 && cd /tmp/cc1 && cp ${APP}/mk/f1.c . && cc -c f1.c && echo CC_OK")
 if echo "${kout}" | grep -q "CC_OK"; then

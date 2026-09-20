@@ -8,7 +8,7 @@ assert len(sys.argv) == 3
 USYS_LIST = sys.argv[1]
 OUTPUT_FILE = sys.argv[2]
 
-SYS_NR = 456
+SYS_NR = 512
 
 # Header files scanned in the given order to get a list of syscall numbers.
 # The first file found is used.
@@ -165,13 +165,17 @@ BYTE_SPAN_ARGS = {
 systabl_targets = [None for i in range(SYS_NR)]
 systabl_strace_targets = [None for i in range(SYS_NR)]
 
-systabl_targets[451] = "junction_fncall_stackswitch_enter"
-systabl_targets[452] = "junction_fncall_stackswitch_enter_preserve_regs"
-systabl_targets[453] = "junction_fncall_enter"
-systabl_targets[454] = "junction_fncall_enter_preserve_regs"
-systabl_targets[455] = "junction_fncall_stackswitch_enter_eax"
+# Entry trampolines occupy the last five slots, above every Linux syscall
+# number (see systbl.h). The guest glibc and the vdso hardcode these
+# addresses: 0x200000 + 8 * slot.
+TRAMPOLINE_FIRST = 507
+systabl_targets[507] = "junction_fncall_stackswitch_enter"                # 0x200fd8
+systabl_targets[508] = "junction_fncall_stackswitch_enter_preserve_regs"  # 0x200fe0
+systabl_targets[509] = "junction_fncall_enter"                            # 0x200fe8
+systabl_targets[510] = "junction_fncall_enter_preserve_regs"              # 0x200ff0
+systabl_targets[511] = "junction_fncall_stackswitch_enter_eax"            # 0x200ff8
 
-for i in range(451, 456):
+for i in range(TRAMPOLINE_FIRST, SYS_NR):
     systabl_strace_targets[i] = systabl_targets[i]
 
 def genLogSyscallCall(pretty_name, with_ret, fnname):
