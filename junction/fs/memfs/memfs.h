@@ -54,6 +54,8 @@ inline bool NeedsTrace() {
 std::shared_ptr<ISoftLink> CreateISoftLink(std::string path);
 // Create a character or block device inode.
 std::shared_ptr<Inode> CreateIDevice(dev_t dev, mode_t mode);
+// Create a named pipe (FIFO) inode.
+std::shared_ptr<Inode> CreateIFifo(mode_t mode);
 
 class MemInode : public Inode {
   class Token {

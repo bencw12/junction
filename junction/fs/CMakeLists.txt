@@ -11,6 +11,7 @@ add_library(fs
   linuxfs/linuxfs.cc
   memfs/memfs.cc
   memfs/dir.cc
+  memfs/fifo.cc
   pipe.cc
   poll.cc
   procfs/procfs.cc

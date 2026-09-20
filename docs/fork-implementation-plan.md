@@ -862,9 +862,9 @@ requires the output to match. A subset also runs under `--debug_as_audit`.
 
 **Passing:** the `sh` and `bash` loops (240 backgrounded subshell pipelines,
 16 in flight), `multiprocessing.Pool(8)` five times over 2000 tasks (output
-identical to native), `subprocess.run` x150, `git log`, and 30 s of worker
-pools created and torn down (9/9 standalone runs) -- with the audit finding no
-divergence on any of them.
+identical to native), `subprocess.run` x150, `git log`, `cp -r` (which calls
+`fchmodat2`), and 30 s of worker pools created and torn down (9/9 standalone
+runs) -- with the audit finding no divergence on any of them.
 
 **What it found, in order of what it means:**
 
@@ -883,20 +883,27 @@ divergence on any of them.
    classified "LibOS mapping" by the current process's regions, so another live
    guest's memory -- correctly absent from every clone but its own -- was
    reported as a failed propagation. It classifies by the partition now.
-3. **A pre-existing syscall-number collision, root-caused, not yet fixed.**
-   `cp -r` dies deterministically. Junction uses syscall-table slots 452-455 for
-   its own entry trampolines (`systbl.py`, and `JUNCTION_ENTRY_*` in the guest
-   glibc's `sysdep.h`), chosen in mid-2023 when Linux stopped at 451. Linux 6.6
-   made 452 `fchmodat2`, and coreutils 9.4's `cp -r` calls it once per
-   directory. The call dispatches into the entry trampoline as if it were a
-   handler, which re-reads a stale value as the syscall number and transforms it
-   again -- the fault at `0x1207100` is `(0x200E20 << 3) + 0x200000`, and
-   `0x200E20` is `&table[452]`. Nothing to do with address spaces; it blocks
-   `make` only because the test copied its inputs with `cp -r`. The fix is to
-   move the entry slots out of the Linux number range on both sides -- Junction's
-   `systbl.py`/`syscall.cc` and the guest glibc's `sysdep.h` -- and give 452 a
-   real `fchmodat2`. The glibc half is in `lib/glibc`, which has uncommitted
-   work of its own, so it is not done here without a decision.
+3. **A pre-existing syscall-number collision, fixed.** `cp -r` died
+   deterministically. Junction used syscall-table slots 452-455 for its own
+   entry trampolines (`systbl.py`, and `JUNCTION_ENTRY_*` in the guest glibc's
+   `sysdep.h`), chosen in mid-2023 when Linux stopped at 451. Linux 6.6 made
+   452 `fchmodat2`, and coreutils 9.4's `cp -r` calls it once per directory.
+   The call dispatched into the entry trampoline as if it were a handler, which
+   re-read a stale value as the syscall number and transformed it again -- the
+   fault at `0x1207100` was `(0x200E20 << 3) + 0x200000`, and `0x200E20` is
+   `&table[452]`. Nothing to do with address spaces; it blocked `make` only
+   because the test copied its inputs with `cp -r`. The table is now 512 slots
+   (still exactly one page) with the trampolines at 507-511, above anything
+   Linux will assign soon, on all three sides that hardcode them: `systbl.py`/
+   `systbl.h`/`syscall.cc`, the vDSO stub (`vdso.S`), and the guest glibc
+   (`sysdep.h`, via patch 0005 so `install_glibc.sh` reproduces it); 452 is a
+   real `fchmodat2` that delegates to `fchmodat`. The rebuilt libc has 523
+   references to the new addresses, every one a `call`, and none to the old.
+   `cp -r` now matches native's file list and content hash; the case is a
+   comparison rather than a pin. (The `lib/glibc` submodule pointer is
+   unchanged: it records the unpatched base, and `install_glibc.sh` applies the
+   patches on top; the eleven commits in the working submodule are that
+   script's output, not work of their own.)
 4. **A pre-existing `wait4` semantics bug, fixed.** With `WNOHANG` and children
    that exist but are not yet ready, `DoWait` returned `EAGAIN`; Linux returns
    0 (`ECHILD` only when there are no children at all). GNU `make -jN` polls
@@ -970,6 +977,27 @@ divergence on any of them.
 8. **Pre-existing limits, pinned:** one non-relocatable binary at a time
    (`cc1` is one, so `make -j` cannot drive gcc; per-process address spaces are
    what could lift this); and a per-process thread limit a guest hits at 1023.
+9. **A pre-existing missing feature, added: FIFOs in memfs.** `mknod` with
+   `S_IFIFO` was `EINVAL`, so `mkfifo(1)`, `mkfifo(3)` and everything built on
+   them (shell process-substitution idioms, older GNU make jobservers) failed.
+   `memfs/fifo.cc` adds a FIFO inode: one channel for the inode's whole life,
+   the files opened on it are its ends, and the channel's existing
+   closed-flag machinery (EOF, `EPIPE`, `POLLHUP`, `POLLERR`) is driven by the
+   count of open readers and writers instead of by one file's destructor. The
+   channel gained a `MultiReader` parameter to match its `MultiWriter` one --
+   any number of processes may hold either end -- plus reopen and detach
+   operations. `open` follows Linux's `fifo_open`: a plain reader or writer
+   waits for a partner, `O_RDWR` and `O_NONBLOCK` never wait, `O_WRONLY |
+   O_NONBLOCK` with no reader is `ENXIO`, and the wait is satisfied by a
+   monotonic count of partner *opens* rather than the live count. That last
+   point was a bug the first version had: a writer that opened, wrote and
+   closed before the woken reader ran again left the count at zero, and the
+   reader parked forever -- found because the reader-first case hung while the
+   writer-first case passed, and the same-process (threads) version hung too,
+   which ruled out anything about address spaces. Seven cases in
+   `memfs_test.sh`, each checked against native: writer-first, reader-first,
+   100000 lines through a full pipe, reopen after all writers closed, `test
+   -p`, `ENXIO`, and `select` seeing readable then EOF.
 
 Large pages are hugetlb-backed again (`739cdfc`): the region had quietly
 changed them to 4 KB shmem pages, found because hugetlb pages are invisible to

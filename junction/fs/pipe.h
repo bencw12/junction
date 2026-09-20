@@ -34,7 +34,11 @@ class ConditionalSpinGuard {
   rt::Spin &lock_;
 };
 
-template <class Channel, bool MultiWriter>
+// MultiWriter/MultiReader serialize that side's callers with the channel lock
+// and give it a WaitQueue and a PollSourceSet instead of the single-thread,
+// single-poller versions. pipe(2) needs neither; a FIFO, which any number of
+// processes may open for either side, needs both.
+template <class Channel, bool MultiWriter, bool MultiReader = false>
 class WaitableChannel {
  public:
   explicit WaitableChannel(size_t size) noexcept : chan_(size) {}
@@ -43,6 +47,8 @@ class WaitableChannel {
   template <typename Callable>
   inline Status<size_t> DoRead(bool nonblocking, Callable &&func) {
     size_t n;
+
+    ConditionalSpinGuard<MultiReader> g(lock_);
     while (true) {
       // Read from the channel (without locking).
       Status<size_t> ret = func(chan_);
@@ -59,7 +65,7 @@ class WaitableChannel {
 
       // Channel is empty, block and wait.
       assert(ret.error() == EAGAIN);
-      rt::SpinGuard guard(lock_);
+      ConditionalSpinGuard<!MultiReader> guard(lock_);
       bool signaled = !rt::WaitInterruptible(lock_, read_waker_, [this] {
         return !chan_.is_empty() || writer_is_closed() || reader_is_closed();
       });
@@ -70,7 +76,7 @@ class WaitableChannel {
 
     // Wake the writer and any pollers.
     {
-      rt::SpinGuard guard(lock_);
+      ConditionalSpinGuard<!MultiReader> guard(lock_);
       if (chan_.is_empty() && read_poll_) read_poll_.Clear(kPollIn);
       if (writer_is_closed()) return n;
       if (!chan_.is_full() && write_poll_) {
@@ -117,7 +123,7 @@ class WaitableChannel {
       if (reader_is_closed()) return MakeError(EPIPE);
       if (!chan_.is_empty() && read_poll_) {
         read_poll_.Set(kPollIn);
-        read_waker_.Wake();
+        WakeReader();
       }
     }
     return n;
@@ -148,6 +154,28 @@ class WaitableChannel {
   void CloseReader(PollSource *p = nullptr);
   void CloseWriter(PollSource *p = nullptr);
 
+  // A FIFO opens and closes each end many times over the life of one channel,
+  // so it needs the inverse of CloseReader/CloseWriter, and a way to drop one
+  // poller without closing the end it belongs to.
+  void ReopenReader() {
+    rt::SpinGuard guard(lock_);
+    reader_closed_.store(false, std::memory_order_release);
+    if (write_poll_) write_poll_.Clear(kPollErr);
+  }
+  void ReopenWriter() {
+    rt::SpinGuard guard(lock_);
+    writer_closed_.store(false, std::memory_order_release);
+    if (read_poll_) read_poll_.Clear(kPollHUp);
+  }
+  void DetachReadPoll(PollSource *p) {
+    rt::SpinGuard guard(lock_);
+    read_poll_.Detach(p);
+  }
+  void DetachWritePoll(PollSource *p) {
+    rt::SpinGuard guard(lock_);
+    write_poll_.Detach(p);
+  }
+
   void AttachReadPoll(PollSource *p) {
     rt::SpinGuard guard(lock_);
     read_poll_.Attach(p);
@@ -176,12 +204,12 @@ class WaitableChannel {
   template <class Archive>
   static void load_and_construct(
       Archive &ar,
-      cereal::construct<WaitableChannel<Channel, MultiWriter>> &construct) {
+      cereal::construct<WaitableChannel<Channel, MultiWriter, MultiReader>> &construct) {
     size_t sz;
     ar(sz);
     construct(sz);
 
-    WaitableChannel<Channel, MultiWriter> &p = *construct.ptr();
+    WaitableChannel<Channel, MultiWriter, MultiReader> &p = *construct.ptr();
     ar(p.chan_, p.reader_closed_, p.writer_closed_);
   }
 
@@ -231,33 +259,48 @@ class WaitableChannel {
     else
       write_waker_.Wake();
   }
+  // One reader is enough after a write; a close must reach every reader.
+  inline void WakeReader() {
+    if constexpr (MultiReader)
+      read_waker_.WakeOne();
+    else
+      read_waker_.Wake();
+  }
+  inline void WakeAllReaders() {
+    if constexpr (MultiReader)
+      read_waker_.WakeAll();
+    else
+      read_waker_.Wake();
+  }
 
   rt::Spin lock_;
   Channel chan_;
   std::atomic<bool> reader_closed_{false};
   std::atomic<bool> writer_closed_{false};
 
-  rt::ThreadWaker read_waker_;
+  std::conditional_t<MultiReader, rt::WaitQueue, rt::ThreadWaker> read_waker_;
   std::conditional_t<MultiWriter, rt::WaitQueue, rt::ThreadWaker> write_waker_;
 
-  SinglePollSource read_poll_;
+  std::conditional_t<MultiReader, PollSourceSet, SinglePollSource> read_poll_;
   std::conditional_t<MultiWriter, PollSourceSet, SinglePollSource> write_poll_;
 };
 
-template <class Channel, bool MultiWriter>
-inline void WaitableChannel<Channel, MultiWriter>::CloseWriter(PollSource *p) {
+template <class Channel, bool MultiWriter, bool MultiReader>
+inline void WaitableChannel<Channel, MultiWriter, MultiReader>::CloseWriter(
+    PollSource *p) {
   rt::SpinGuard guard(lock_);
   writer_closed_.store(true, std::memory_order_release);
   if (!reader_is_closed() && read_poll_) {
     read_poll_.Set(kPollHUp);
-    read_waker_.Wake();
+    WakeAllReaders();
   }
   if (p) write_poll_.Detach(p);
   WakeWriters();
 }
 
-template <class Channel, bool MultiWriter>
-inline void WaitableChannel<Channel, MultiWriter>::CloseReader(PollSource *p) {
+template <class Channel, bool MultiWriter, bool MultiReader>
+inline void WaitableChannel<Channel, MultiWriter, MultiReader>::CloseReader(
+    PollSource *p) {
   rt::SpinGuard guard(lock_);
   reader_closed_.store(true, std::memory_order_release);
   if (!writer_is_closed() && write_poll_) {
@@ -265,7 +308,7 @@ inline void WaitableChannel<Channel, MultiWriter>::CloseReader(PollSource *p) {
     WakeWriters();
   }
   if (p) read_poll_.Detach(p);
-  read_waker_.Wake();
+  WakeAllReaders();
 }
 
 }  // namespace
@@ -273,5 +316,7 @@ inline void WaitableChannel<Channel, MultiWriter>::CloseReader(PollSource *p) {
 using StreamPipe = WaitableChannel<ByteChannel, false>;
 using MsgPipe = WaitableChannel<MessageChannel<void>, false>;
 using MultiWriterMsgPipe = WaitableChannel<MessageChannel<void>, true>;
+// The channel behind a named pipe (memfs/fifo.cc).
+using FifoPipe = WaitableChannel<ByteChannel, true, true>;
 
 }  // namespace junction

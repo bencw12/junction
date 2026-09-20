@@ -16,6 +16,8 @@ Status<std::shared_ptr<DirectoryEntry>> MemIDir::LookupMissLocked(
 
 Status<void> MemIDir::MkNod(std::string_view name, mode_t mode, dev_t dev) {
   DoInitCheck();
+  if ((mode & kTypeMask) == kTypeFIFO)
+    return Insert(std::string(name), CreateIFifo(mode));
   if ((mode & (kTypeCharacter | kTypeBlock)) == 0) return MakeError(EINVAL);
   auto ino = CreateIDevice(dev, mode);
   return Insert(std::string(name), std::move(ino));
