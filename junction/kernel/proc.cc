@@ -33,6 +33,7 @@ extern "C" {
 #include "junction/kernel/ksys.h"
 #include "junction/kernel/memprobe.h"
 #include "junction/kernel/mm.h"
+#include "junction/fs/fsstat.h"
 #include "junction/kernel/proc.h"
 #include "junction/kernel/usys.h"
 #include "junction/limits.h"
@@ -246,7 +247,9 @@ Thread::~Thread() {
                   << GetActiveAddressSpace() << ", want " << want;
     }
     *child_tid = 0;
-    FutexTable::GetFutexTable().Wake(child_tid);
+    // The kernel's clear_child_tid wake is a process-shared one; it reaches
+    // this process's joiner whichever way that waited.
+    FutexTable::GetFutexTable().Wake(&proc_->get_mem_map(), true, child_tid);
   }
   bool proc_done = proc_->ThreadFinish(this);
   if (tid_ != proc_->get_pid()) ReleasePid(tid_);
@@ -308,6 +311,7 @@ void Process::ProcessFinish() {
   }
   // Check if init has died
   if (unlikely(init_proc.get() == this)) {
+    FsStatReport("exit");  // the sandbox's final filesystem tally
     syscall_exit(xstate_);
     std::unreachable();
   }
@@ -371,6 +375,9 @@ void Process::FinishExec(std::shared_ptr<MemoryMap> &&new_mm) {
   }
 
   file_tbl_.DoCloseOnExec();
+  signal_tbl_.OnExec();
+  traceme_.store(false);
+  posix_timers_.Clear();
   mem_map_ = std::move(new_mm);
   vfork_waker_.Wake();
 }
@@ -381,7 +388,8 @@ bool Process::ThreadFinish(Thread *th) {
   thread_map_.erase(th->get_tid());
   size_t remaining_threads = thread_map_.size();
   if (remaining_threads == 1) exec_waker_.Wake();
-  if (is_stopped() && stopped_count_ == remaining_threads)
+  if (is_stopped() && stopped_count_ == remaining_threads &&
+      stop_is_guest_visible_)
     NotifyParentWait(kWaitableStopped);
   return remaining_threads == 0;
 }
@@ -467,6 +475,10 @@ Status<std::shared_ptr<Process>> Process::CreateProcessFork(
     ReleasePid(*pid, get_pgid(), get_sid());
     return MakeError(as);
   }
+
+  // Whatever of other guests' memory got into the clone despite @exclude.
+  SweepClonedAddressSpace(
+      *as, MemoryMap::GetOtherGuestRegions(mem_map_->get_reservation()));
 
   // Each fork is a chance to notice what has diverged since the last one: the
   // audit compares every live address space against this one.
@@ -574,18 +586,36 @@ int Process::GetWaitStatus() const {
   }
 }
 
-void Process::ReapChild(Process *child) {
+// Returns what was removed instead of destroying it. The caller holds
+// shared_sig_q_, a spinlock, so preemption is off -- and this is usually the
+// child's last reference: ~Process() takes blocking locks (~ProcFSData, the
+// memory map), and a contended one parks the thread with preemption disabled.
+// The scheduler calls that a bug ("sched.c:340", preempt_cnt 2) and takes the
+// runtime down. It needed contention to show: about one sandbox in twenty-five
+// with sixteen running. The references die once the caller has let go.
+std::vector<std::shared_ptr<Process>> Process::ReapChild(Process *child) {
   assert(shared_sig_q_.IsHeld());
+  std::vector<std::shared_ptr<Process>> dead;
 
   if (child->wait_state_ != kWaitableExited) {
     child->wait_state_ = kNotWaitable;
-    return;
+    return dead;
   }
 
+  // The child's hold on us, likewise: it may be our own last reference but
+  // one, and is in any case not something to destroy under a spinlock.
+  std::shared_ptr<Process> parent_ref = std::move(child->parent_);
   child->parent_.reset();
-  std::erase_if(child_procs_, [child](std::shared_ptr<Process> &p) {
-    return p.get() == child;
-  });
+  for (auto it = child_procs_.begin(); it != child_procs_.end();) {
+    if (it->get() == child) {
+      dead.push_back(std::move(*it));
+      it = child_procs_.erase(it);
+    } else {
+      ++it;
+    }
+  }
+  if (parent_ref) dead.push_back(std::move(parent_ref));
+  return dead;
 }
 
 void Process::NotifyParentWait(unsigned int state, int status) {
@@ -706,8 +736,10 @@ Status<pid_t> Process::DoWait(idtype_t idtype, id_t id, int options,
   int status = p->GetWaitStatus();
   if (infop) p->FillWaitInfo(info);
   pid_t pid = p->get_pid();
-  if (!dont_reap) ReapChild(p);
+  std::vector<std::shared_ptr<Process>> dead;
+  if (!dont_reap) dead = ReapChild(p);
   g.Unlock();
+  dead.clear();  // ~Process(), now that it may block
 
   // Write to the caller's memory only after dropping the lock. A fault here
   // would otherwise be taken with preemption disabled, which is not
@@ -838,7 +870,7 @@ void Process::ThreadStopWait() {
   if (!is_stopped()) return;
 
   if (++stopped_count_ == thread_map_.size()) {
-    NotifyParentWait(kWaitableStopped);
+    if (stop_is_guest_visible_) NotifyParentWait(kWaitableStopped);
 
     // Also notify waiters that all threads have stopped
     stopped_threads_.WakeAll();
@@ -1050,19 +1082,39 @@ long usys_getpid() {
 
 long usys_gettid() { return mythread().get_tid(); }
 
+// There is no tracing, but there are programs that use PTRACE_TRACEME to ask
+// whether anyone is tracing them: it fails with EPERM if a tracer is already
+// attached, so a failure means "debugger present" and they refuse to run.
+// ENOSYS is such a failure. Answer as Linux does for an untraced process --
+// success the first time, EPERM after that, since it is then its parent's
+// tracee -- and refuse everything else as having no such tracee.
+long usys_ptrace(long request, [[maybe_unused]] long pid,
+                 [[maybe_unused]] void *addr, [[maybe_unused]] void *data) {
+  constexpr long kPtraceTraceme = 0;
+  if (request != kPtraceTraceme) return -ESRCH;
+  return myproc().TestAndSetTraceme() ? -EPERM : 0;
+}
+
 long usys_getpgrp() { return myproc().get_pgid(); }
 
 long usys_setpgid(pid_t pid, pid_t pgid) {
   // TODO: check that pgid is a valid process group and that pgid's sid matches.
   Status<void> ret;
 
-  if (pgid == 0) pgid = myproc().get_pgid();
+  if (pgid < 0) return -EINVAL;
 
+  // A pgid of zero names the target process itself: it becomes the leader of a
+  // new group. timeout(1) relies on this before it signals its own group.
   if (pid == 0 || pid == myproc().get_pid()) {
-    ret = myproc().JoinProcessGroup(pgid);
+    Process &p = myproc();
+    if (pgid == 0) pgid = p.get_pid();
+    if (p.get_pgid() == pgid) return 0;
+    ret = p.JoinProcessGroup(pgid);
   } else {
     std::shared_ptr<Process> proc = Process::Find(pid);
     if (!proc) return -ESRCH;
+    if (pgid == 0) pgid = proc->get_pid();
+    if (proc->get_pgid() == pgid) return 0;
     ret = proc->JoinProcessGroup(pgid);
   }
 
@@ -1186,8 +1238,31 @@ long usys_clone(unsigned long clone_flags, unsigned long newsp,
     assert(tptr->cold().ref_count_ == 0);
     rt::Preempt::Unlock();
     RunOnSyscallStack([tptr]() {
+      // ~Thread() can drop the last reference to the process, and with it the
+      // memory map, which releases the process's address space. This thread
+      // is still schedulable until it exits: preempted in between, on_sched()
+      // would rebind the core to an address space that is gone ("as: failed to
+      // switch to address space N", and Junction exits -- rare alone, routine
+      // with several instances competing for cores).
+      //
+      // So the process outlives the destructor, which needs the address space
+      // (it clears child_tid in guest memory). Then preemption goes off for
+      // good: this thread is never scheduled again, so nothing will look for
+      // its address space. It leaves that space -- what remains runs on LibOS
+      // memory, mapped everywhere -- and hands the last reference to a thread
+      // of the runtime's own, because dropping it can block (~Process) and
+      // this one no longer may.
+      //
+      // (An earlier version cleared junction_thread here instead and let the
+      // thread be preempted as a plain runtime thread while on a guest
+      // syscall stack; schedule() then tripped over the preempt count,
+      // sched.c:340, about once in a hundred sandboxes.)
+      std::shared_ptr<Process> keep = tptr->get_process_shared();
       tptr->~Thread();
-      rt::Exit();
+      rt::Preempt::Lock();
+      ActivateAddressSpace(kRootAddressSpace);
+      rt::Spawn([k = std::move(keep)]() mutable { k.reset(); });
+      thread_exit_np();
     });
   }
 

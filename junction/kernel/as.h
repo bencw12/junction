@@ -86,6 +86,10 @@ void ActivateAddressSpace(uint64_t handle);
 // after the address space has been released.
 [[nodiscard]] bool TryActivateAddressSpace(uint64_t handle);
 
+// What the kernel says the running kthread is bound to, as opposed to what
+// this core last recorded. Diagnostics only: it is a system call.
+[[nodiscard]] uint64_t QueryBoundAddressSpace();
+
 // The handle the running kthread is bound to.
 [[nodiscard]] uint64_t GetActiveAddressSpace();
 
@@ -137,5 +141,26 @@ size_t ForEachOtherAddressSpace(void (*fn)(uint64_t handle, void *ctx),
 // Logs every mapping of the current address space that overlaps [start, end).
 // Diagnostic for MM Panic: says what is really there.
 void DumpMappingsOverlapping(uintptr_t start, uintptr_t end);
+
+// Unmaps @stray from the address space @handle, which was just cloned.
+//
+// MADV_DONTFORK keeps other guests' memory out of a clone only as far as it
+// was marked, and two things slip past the marking. Guests that share the
+// address space being cloned -- vfork+exec'd children live in their parent's
+// -- keep running: one that mmap()s inside its own region after the marking
+// pass makes a mapping with no mark on it, and one that execs after the list
+// of regions was drawn up reserves a region that is not on it. Either ends up
+// in the clone. The owner later unmaps its region from its own address space
+// only; the region is handed out again; and the first exec given it inside
+// the clone finds it occupied ("mm: Create wanted ... got 0 ... err=17", then
+// "MM Panic"). That took make -j56 in one of sixteen concurrent sandboxes to
+// hit, about one such build in seven.
+//
+// So the clone is swept afterwards, with a list drawn up after the clone: a
+// region is registered before anything is mapped in it, so that list covers
+// everything that can have been copied, and unmapping a range that turns out
+// to be empty costs nothing.
+void SweepClonedAddressSpace(uint64_t handle,
+                             const std::vector<AddressRange> &stray);
 
 }  // namespace junction

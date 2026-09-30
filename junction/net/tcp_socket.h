@@ -124,6 +124,10 @@ class TCPSocket : public IPSocket {
     if (unlikely(!ptr)) return MakeError(EINVAL);
     switch (state_) {
       case SocketState::kSockUnbound:
+        // getsockname() before bind() is legal and reports 0.0.0.0:0; there is
+        // no bind token to ask yet.
+        ptr.FromNetAddr(netaddr{0, 0});
+        break;
       case SocketState::kSockBound:
         ptr.FromNetAddr(BindToken().LocalAddr());
         break;
@@ -263,26 +267,50 @@ class TCPSocket : public IPSocket {
 
   [[nodiscard]] rt::TCPConn &TcpConn() {
     assert(state_ == SocketState::kSockConnected);
+    if (unlikely(!std::holds_alternative<rt::TCPConn>(v_)))
+      LOG(ERR) << "tcp socket: rt::TCPConn wanted in state "
+               << static_cast<int>(state_) << ", variant index " << v_.index()
+               << ", caller " << __builtin_return_address(0);
     return std::get<rt::TCPConn>(v_);
   }
   [[nodiscard]] rt::TCPQueue &TcpQueue() {
     assert(state_ == SocketState::kSockListening);
+    if (unlikely(!std::holds_alternative<rt::TCPQueue>(v_)))
+      LOG(ERR) << "tcp socket: rt::TCPQueue wanted in state "
+               << static_cast<int>(state_) << ", variant index " << v_.index()
+               << ", caller " << __builtin_return_address(0);
     return std::get<rt::TCPQueue>(v_);
   }
   [[nodiscard]] const rt::TCPConn &TcpConn() const {
     assert(state_ == SocketState::kSockConnected);
+    if (unlikely(!std::holds_alternative<rt::TCPConn>(v_)))
+      LOG(ERR) << "tcp socket: rt::TCPConn wanted in state "
+               << static_cast<int>(state_) << ", variant index " << v_.index()
+               << ", caller " << __builtin_return_address(0);
     return std::get<rt::TCPConn>(v_);
   }
   [[nodiscard]] const rt::TCPQueue &TcpQueue() const {
     assert(state_ == SocketState::kSockListening);
+    if (unlikely(!std::holds_alternative<rt::TCPQueue>(v_)))
+      LOG(ERR) << "tcp socket: rt::TCPQueue wanted in state "
+               << static_cast<int>(state_) << ", variant index " << v_.index()
+               << ", caller " << __builtin_return_address(0);
     return std::get<rt::TCPQueue>(v_);
   }
   [[nodiscard]] rt::BindToken &BindToken() {
     assert(state_ == SocketState::kSockBound);
+    if (unlikely(!std::holds_alternative<rt::BindToken>(v_)))
+      LOG(ERR) << "tcp socket: rt::BindToken wanted in state "
+               << static_cast<int>(state_) << ", variant index " << v_.index()
+               << ", caller " << __builtin_return_address(0);
     return std::get<rt::BindToken>(v_);
   }
   [[nodiscard]] const rt::BindToken &BindToken() const {
     assert(state_ == SocketState::kSockBound);
+    if (unlikely(!std::holds_alternative<rt::BindToken>(v_)))
+      LOG(ERR) << "tcp socket: rt::BindToken wanted in state "
+               << static_cast<int>(state_) << ", variant index " << v_.index()
+               << ", caller " << __builtin_return_address(0);
     return std::get<rt::BindToken>(v_);
   }
 

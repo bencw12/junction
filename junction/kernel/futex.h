@@ -18,12 +18,28 @@ namespace junction {
 namespace detail {
 
 struct futex_waiter {
-  futex_waiter(rt::ThreadWaker *waker, uint32_t *key, uint32_t bitset)
-      : waker(waker), key(key), bitset(bitset) {}
+  futex_waiter(rt::ThreadWaker *waker, uint32_t *key, uint32_t bitset,
+               const void *mm, bool shared)
+      : waker(waker), key(key), bitset(bitset), mm(mm), shared(shared) {}
+
+  // An address names memory only together with the address space it is in.
+  // Forked processes have identical layouts, so two of them wait on the same
+  // address all the time; with the address alone as the key, one process's
+  // FUTEX_WAKE(addr, 1) was delivered to the other's waiter -- a spurious
+  // wakeup there, and a lost one here, for good. A wake matches a waiter of
+  // the same memory map, or, as on Linux, across processes only when both the
+  // wait and the wake are process-shared (no FUTEX_PRIVATE_FLAG).
+  [[nodiscard]] bool Matches(const uint32_t *k, uint32_t bits, const void *wmm,
+                             bool wshared) const {
+    if (key != k || !(bitset & bits)) return false;
+    return mm == wmm || (shared && wshared);
+  }
 
   rt::ThreadWaker *waker;
   uint32_t *key;
   uint32_t bitset;
+  const void *mm;
+  bool shared;
   IntrusiveListNode node;
 };
 
@@ -48,13 +64,16 @@ class alignas(kCacheLineSize) FutexTable {
 
   // Wait blocks on the address @key. However, it returns ETIMEDOUT if the
   // timeout expires, or EAGAIN if @val doesn't match the value in the address.
-  Status<void> Wait(uint32_t *key, uint32_t val,
+  // @mm identifies the caller's address space (its MemoryMap); @shared says
+  // the operation was not FUTEX_PRIVATE.
+  Status<void> Wait(const void *mm, bool shared, uint32_t *key, uint32_t val,
                     uint32_t bitset = kFutexBitsetAny,
                     std::optional<Time> timeout = {});
 
   // Wake unblocks up to @n threads waiting on the address @key. Returns the
   // number of threads woken.
-  int Wake(uint32_t *key, int n = INT_MAX, uint32_t bitset = kFutexBitsetAny);
+  int Wake(const void *mm, bool shared, uint32_t *key, int n = INT_MAX,
+           uint32_t bitset = kFutexBitsetAny);
 
   static FutexTable &GetFutexTable();
 

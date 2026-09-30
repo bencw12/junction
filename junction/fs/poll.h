@@ -214,7 +214,9 @@ inline void PollSource::Detach(PollObserver &o) {
   observers_.erase(decltype(observers_)::s_iterator_to(o));
 }
 
-inline void PollObserver::Detach() { src_->Detach(*this); }
+inline void PollObserver::Detach() {
+  if (src_) src_->Detach(*this);  // never attached: poll() skipped its slot
+}
 
 // Poller is a simple wrapper that runs a lambda when poll events trigger.
 class Poller : public PollObserver {

@@ -699,15 +699,31 @@ class UnixStreamSocket : public Socket {
   }
 
   [[nodiscard]] UnixStreamListener &Listener() {
+    if (unlikely(!std::holds_alternative<UnixStreamListener>(v_)))
+      LOG(ERR) << "unix socket: UnixStreamListener wanted in state "
+               << static_cast<int>(state_) << ", variant index " << v_.index()
+               << ", caller " << __builtin_return_address(0);
     return std::get<UnixStreamListener>(v_);
   }
   [[nodiscard]] UnixStreamConnection &Connection() {
+    if (unlikely(!std::holds_alternative<UnixStreamConnection>(v_)))
+      LOG(ERR) << "unix socket: UnixStreamConnection wanted in state "
+               << static_cast<int>(state_) << ", variant index " << v_.index()
+               << ", caller " << __builtin_return_address(0);
     return std::get<UnixStreamConnection>(v_);
   }
   [[nodiscard]] const UnixStreamListener &Listener() const {
+    if (unlikely(!std::holds_alternative<UnixStreamListener>(v_)))
+      LOG(ERR) << "unix socket: UnixStreamListener wanted in state "
+               << static_cast<int>(state_) << ", variant index " << v_.index()
+               << ", caller " << __builtin_return_address(0);
     return std::get<UnixStreamListener>(v_);
   }
   [[nodiscard]] const UnixStreamConnection &Connection() const {
+    if (unlikely(!std::holds_alternative<UnixStreamConnection>(v_)))
+      LOG(ERR) << "unix socket: UnixStreamConnection wanted in state "
+               << static_cast<int>(state_) << ", variant index " << v_.index()
+               << ", caller " << __builtin_return_address(0);
     return std::get<UnixStreamConnection>(v_);
   }
 
@@ -837,8 +853,15 @@ Status<std::shared_ptr<Socket>> CreateUnixSocket(int type, int protocol,
 
 long usys_socketpair(int domain, int type, int protocol, int sv[2]) {
   if (domain != AF_UNIX || protocol != 0) return -EAFNOSUPPORT;
-  bool datagram = (type & kSockTypeMask) == SOCK_DGRAM;
-  if (!datagram && (type & kSockTypeMask) != SOCK_STREAM) return -EINVAL;
+  // SOCK_SEQPACKET is approximated by a stream pair: connection-oriented, with
+  // end-of-file when the peer closes, but without message boundaries. EOF is
+  // the half that callers block on. Rust's std creates one of these for every
+  // child it spawns and reads it until the child sends a pidfd or closes its
+  // end at exec; refusing the socket type fails the spawn outright.
+  const int socktype = type & kSockTypeMask;
+  bool datagram = socktype == SOCK_DGRAM;
+  if (!datagram && socktype != SOCK_STREAM && socktype != SOCK_SEQPACKET)
+    return -EINVAL;
   auto [fd1, fd2] = CreatePipeSocket(type & ~kSockTypeMask, datagram);
   sv[0] = fd1;
   sv[1] = fd2;

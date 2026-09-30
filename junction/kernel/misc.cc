@@ -111,29 +111,96 @@ long usys_geteuid() { return mythread().get_creds().euid; }
 long usys_getgid() { return mythread().get_creds().rgid; }
 long usys_getegid() { return mythread().get_creds().egid; }
 
-long usys_setgid(gid_t gid) {
-  Credential &creds = mythread().get_creds();
-  creds.rgid = creds.egid = creds.sgid = gid;
+// Changing IDs follows Linux's rules rather than always succeeding: a process
+// that has given up root must not be able to take it back. Programs check.
+// sshd's pre-authentication child drops to the sshd user and then tries to
+// restore its old IDs, and treats success as fatal ("permanently_set_uid: was
+// able to restore old [e]gid"), which ended every login.
+namespace {
+
+constexpr bool Unset(unsigned int id) { return static_cast<int>(id) == -1; }
+
+// CAP_SETUID and CAP_SETGID, which here is being root.
+bool MaySetAnyId(const Credential &c) { return c.euid == 0; }
+
+template <typename T>
+bool OneOf(T id, T a, T b, T c) { return id == a || id == b || id == c; }
+
+template <typename T>
+long SetRes(bool privileged, T &r, T &e, T &s, T nr, T ne, T ns) {
+  if (!privileged) {
+    if (!Unset(nr) && !OneOf(nr, r, e, s)) return -EPERM;
+    if (!Unset(ne) && !OneOf(ne, r, e, s)) return -EPERM;
+    if (!Unset(ns) && !OneOf(ns, r, e, s)) return -EPERM;
+  }
+  if (!Unset(nr)) r = nr;
+  if (!Unset(ne)) e = ne;
+  if (!Unset(ns)) s = ns;
   return 0;
+}
+
+template <typename T>
+long SetRe(bool privileged, T &r, T &e, T &s, T nr, T ne) {
+  if (!privileged) {
+    if (!Unset(nr) && nr != r && nr != e) return -EPERM;
+    if (!Unset(ne) && !OneOf(ne, r, e, s)) return -EPERM;
+  }
+  const T old_r = r;
+  if (!Unset(nr)) r = nr;
+  if (!Unset(ne)) e = ne;
+  // The saved ID follows the effective one if the real ID was set, or the
+  // effective one became something other than the old real ID.
+  if (!Unset(nr) || (!Unset(ne) && ne != old_r)) s = e;
+  return 0;
+}
+
+template <typename T>
+long SetOne(bool privileged, T &r, T &e, T &s, T id) {
+  if (privileged) {
+    r = e = s = id;
+    return 0;
+  }
+  if (id != r && id != s) return -EPERM;
+  e = id;
+  return 0;
+}
+
+}  // namespace
+
+long usys_setgid(gid_t gid) {
+  Credential &c = mythread().get_creds();
+  return SetOne(MaySetAnyId(c), c.rgid, c.egid, c.sgid, gid);
 }
 
 long usys_setegid(gid_t gid) {
-  mythread().get_creds().egid = gid;
-  return 0;
+  Credential &c = mythread().get_creds();
+  return SetRes(MaySetAnyId(c), c.rgid, c.egid, c.sgid, gid_t(-1), gid,
+                gid_t(-1));
 }
 
 long usys_setuid(uid_t uid) {
-  Credential &creds = mythread().get_creds();
-  creds.ruid = creds.euid = creds.suid = uid;
-  return 0;
+  Credential &c = mythread().get_creds();
+  return SetOne(MaySetAnyId(c), c.ruid, c.euid, c.suid, uid);
 }
 
 long usys_seteuid(uid_t uid) {
-  mythread().get_creds().euid = uid;
-  return 0;
+  Credential &c = mythread().get_creds();
+  return SetRes(MaySetAnyId(c), c.ruid, c.euid, c.suid, uid_t(-1), uid,
+                uid_t(-1));
+}
+
+long usys_setreuid(uid_t ruid, uid_t euid) {
+  Credential &c = mythread().get_creds();
+  return SetRe(MaySetAnyId(c), c.ruid, c.euid, c.suid, ruid, euid);
+}
+
+long usys_setregid(gid_t rgid, gid_t egid) {
+  Credential &c = mythread().get_creds();
+  return SetRe(MaySetAnyId(c), c.rgid, c.egid, c.sgid, rgid, egid);
 }
 
 long usys_setgroups(size_t size, const gid_t *list) {
+  if (!MaySetAnyId(mythread().get_creds())) return -EPERM;
   std::vector<gid_t> &groups = mythread().get_creds().supplementary_groups;
   groups.resize(size);
   std::memcpy(groups.data(), list, sizeof(gid_t) * size);
@@ -151,11 +218,8 @@ long usys_getgroups(int size, gid_t *list) {
 }
 
 long usys_setresuid(uid_t ruid, uid_t euid, uid_t suid) {
-  Credential &creds = mythread().get_creds();
-  if (static_cast<int>(ruid) != -1) creds.ruid = ruid;
-  if (static_cast<int>(euid) != -1) creds.euid = euid;
-  if (static_cast<int>(suid) != -1) creds.suid = suid;
-  return 0;
+  Credential &c = mythread().get_creds();
+  return SetRes(MaySetAnyId(c), c.ruid, c.euid, c.suid, ruid, euid, suid);
 }
 
 long usys_getresuid(uid_t *ruid, uid_t *euid, uid_t *suid) {
@@ -175,11 +239,8 @@ long usys_getresgid(gid_t *rgid, gid_t *egid, gid_t *sgid) {
 }
 
 long usys_setresgid(gid_t rgid, gid_t egid, gid_t sgid) {
-  Credential &creds = mythread().get_creds();
-  if (static_cast<int>(rgid) != -1) creds.rgid = rgid;
-  if (static_cast<int>(egid) != -1) creds.egid = egid;
-  if (static_cast<int>(sgid) != -1) creds.sgid = sgid;
-  return 0;
+  Credential &c = mythread().get_creds();
+  return SetRes(MaySetAnyId(c), c.rgid, c.egid, c.sgid, rgid, egid, sgid);
 }
 
 long usys_prctl(long op, long arg1, long arg2, long arg3, long arg4,

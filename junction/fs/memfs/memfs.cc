@@ -1,7 +1,9 @@
 // memfs.cc - support for memfs inode types
 
 extern "C" {
+#include <linux/falloc.h>
 #include <sys/mman.h>
+#include <sys/syscall.h>
 }
 
 #include "junction/base/bitmap.h"
@@ -63,6 +65,20 @@ char *SlotToAddr(size_t slot) {
   return reinterpret_cast<char *>(memfs_base + slot * kMaxSizeBytes);
 }
 
+// Returns [off, off + len) of a slot's extent to the kernel, by punching the
+// memfd rather than by MADV_REMOVE on the extent's address. The two are the
+// same operation on the object -- MADV_REMOVE on shmem is a hole punch -- but
+// madvise needs the range mapped in the calling address space, and extents are
+// materialised per address space, on demand. An unlink or truncate running in
+// a forked guest that never touched the file got EINVAL and leaked the pages.
+Status<void> PunchExtent(size_t slot, size_t off, size_t len) {
+  long ret = ksyscall(SYS_fallocate, memfs_extent_fd,
+                      FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE,
+                      slot * kMaxSizeBytes + off, len);
+  if (unlikely(ret < 0)) return MakeError(-ret);
+  return {};
+}
+
 // MemIDevice is an inode type for character and block devices
 class MemIDevice : public Inode {
  public:
@@ -120,14 +136,18 @@ Status<void> RestoreMemFs(cereal::BinaryInputArchive &ar) {
 }
 
 MemInode::~MemInode() {
+  FsStatMemfsFiles(-1);
+  FsStatMemfsBytes(-static_cast<int64_t>(size_));
   // Drop the backing pages, and leave the mapping in place.
   //
-  // MADV_REMOVE, not MADV_DONTNEED: this is a shared mapping of a memfd, where
+  // A hole punch, not MADV_DONTNEED: this is a shared mapping of a memfd, where
   // DONTNEED drops only this address space's PTEs and leaves the page -- and
-  // its old contents -- in the file. REMOVE punches the object itself, which
-  // propagates through i_mmap to every address space that maps it, actually
-  // returns the memory, and is what makes the next user of this offset read
-  // zeros. Measured in docs/traces/memfd_reclaim.c.
+  // its old contents -- in the file. Punching the object itself propagates
+  // through i_mmap to every address space that maps it, actually returns the
+  // memory, and is what makes the next user of this offset read zeros.
+  // Measured in docs/traces/memfd_reclaim.c. It goes through the fd rather
+  // than MADV_REMOVE because this address space may not map the extent at all
+  // (see PunchExtent).
   //
   // Not unmapping is deliberate, and is what the 1:1 layout buys. The address
   // of an extent is derived from its slot, so the binding for any address in
@@ -141,7 +161,7 @@ MemInode::~MemInode() {
   // an unmap here would only desynchronise this one -- and it would punch a
   // hole in the reserved region that the next unrelated mmap could be handed.
   if (extent_offset_ != -1) {
-    Status<void> ret = KernelMAdvise(buf_, kMaxSizeBytes, MADV_REMOVE);
+    Status<void> ret = PunchExtent(extent_offset_, 0, kMaxSizeBytes);
     if (unlikely(!ret))
       LOG(WARN) << "meminode: failed to remove pages " << ret.error();
 
@@ -187,6 +207,7 @@ Status<std::shared_ptr<MemInode>> MemInode::Create(mode_t mode) {
     return MakeError(-ret);
   }
   assert(reinterpret_cast<char *>(ret) == addr);
+  FsStatMemfsFiles(1);
   return std::make_shared<MemInode>(Token{}, addr, off, mode);
 }
 
@@ -213,13 +234,16 @@ Status<void> MemInode::SetSize(size_t newlen) {
   size_t oldlen_p = PageAlign(size_);
   if (newlen_p < oldlen_p) {
     // Zero dropped blocks.
-    int advice = extent_offset_ == -1 ? MADV_DONTNEED : MADV_REMOVE;
     Status<void> ret =
-        KernelMAdvise(buf_ + newlen_p, oldlen_p - newlen_p, advice);
+        extent_offset_ == -1
+            ? KernelMAdvise(buf_ + newlen_p, oldlen_p - newlen_p, MADV_DONTNEED)
+            : PunchExtent(extent_offset_, newlen_p, oldlen_p - newlen_p);
     if (unlikely(!ret))
       LOG(WARN) << "meminode: failed to remove pages " << ret.error();
   }
+  FsStatMemfsBytes(static_cast<int64_t>(newlen) - static_cast<int64_t>(size_));
   size_ = newlen;
+  TouchMtime();
   return {};
 }
 

@@ -176,6 +176,9 @@ class Thread {
 
   [[nodiscard]] pid_t get_tid() const { return tid_; }
   [[nodiscard]] Process &get_process() const { return *proc_; }
+  [[nodiscard]] std::shared_ptr<Process> get_process_shared() const {
+    return proc_;
+  }
   [[nodiscard]] uint32_t *get_child_tid() const { return cold().child_tid_; }
   [[nodiscard]] bool needs_interrupt() const {
     assert(GetCaladanThread() == thread_self());
@@ -652,6 +655,9 @@ class Process : public std::enable_shared_from_this<Process> {
   Status<pid_t> BecomeSessionLeader();
 
   [[nodiscard]] bool in_vfork_preexec() const { return !!vfork_waker_; }
+
+  // PTRACE_TRACEME bookkeeping: true once this process has asked to be traced.
+  [[nodiscard]] bool TestAndSetTraceme() { return traceme_.exchange(true); }
   [[nodiscard]] FileTable &get_file_table() { return file_tbl_; }
   [[nodiscard]] MemoryMap &get_mem_map() { return *mem_map_; }
   [[nodiscard]] SignalTable &get_signal_table() { return signal_tbl_; }
@@ -660,6 +666,7 @@ class Process : public std::enable_shared_from_this<Process> {
   [[nodiscard]] Limits &get_limits() { return limits_; }
   [[nodiscard]] bool exited() const { return access_once(exited_); }
   [[nodiscard]] ITimer &get_itimer() { return it_real_; }
+  [[nodiscard]] PosixTimerTable &get_posix_timers() { return posix_timers_; }
   [[nodiscard]] bool is_stopped() const { return stopped_gen_ % 2 == 1; }
   [[nodiscard]] size_t thread_count() const { return thread_map_.size(); }
   [[nodiscard]] int get_xstate() const { return xstate_; }
@@ -680,6 +687,16 @@ class Process : public std::enable_shared_from_this<Process> {
   Status<Thread *> CreateThread(const Thread &oldth);
 
   void FinishExec(std::shared_ptr<MemoryMap> &&new_mm);
+
+  // Points this process at @mm before its exec has finished. The scheduler
+  // binds a core to the address space of a thread's process's memory map, so
+  // an exec that moves to a new address space has to say so before it blocks.
+  // Returns the map that was replaced: the caller decides when it dies.
+  [[nodiscard]] std::shared_ptr<MemoryMap> AdoptMemoryMap(
+      std::shared_ptr<MemoryMap> mm) {
+    std::swap(mem_map_, mm);
+    return mm;
+  }
 
   // Called by a thread to notify that it is exiting.
   // Returns true if this was the last thread.
@@ -730,12 +747,20 @@ class Process : public std::enable_shared_from_this<Process> {
   // Records that this process is being killed by an unhandled signal. Linux
   // reports such a death as WIFSIGNALED with the signal number, not as an exit
   // code, and wait() callers routinely distinguish the two.
-  void set_term_signal(int signo) { term_signal_ = signo; }
+  // Records the signal that is ending this process, for wait() to report.
+  // Not once the process is already exiting: exit_group() ends the sibling
+  // threads with an internal SIGKILL, and one that is in user code at that
+  // moment comes through the same kill handler. Recording that made a clean
+  // exit_group(0) read as "Killed" to the parent -- uvx, after every test had
+  // passed, about once in two hundred verifier runs.
+  void set_term_signal(int signo) {
+    if (!exited()) term_signal_ = signo;
+  }
   [[nodiscard]] int get_term_signal() const { return term_signal_; }
 
   void FillWaitInfo(siginfo_t &info) const;
   int GetWaitStatus() const;
-  void ReapChild(Process *child);
+  [[nodiscard]] std::vector<std::shared_ptr<Process>> ReapChild(Process *child);
   void NotifyParentWait(unsigned int state, int status = 0);
   Status<pid_t> DoWait(idtype_t idtype, id_t id, int options, siginfo_t *infop,
                        int *wstatus);
@@ -791,6 +816,11 @@ class Process : public std::enable_shared_from_this<Process> {
     fs_.SetCwd(std::move(new_cwd));
   }
 
+  void SetRoot(std::shared_ptr<DirectoryEntry> new_root) {
+    rt::SpinGuard g(fs_lock_);
+    fs_.SetRoot(std::move(new_root));
+  }
+
   [[nodiscard]] Duration GetRuntime() {
     Duration d(0);
     rt::ScopedLock g(child_thread_lock_);
@@ -842,6 +872,13 @@ class Process : public std::enable_shared_from_this<Process> {
     rt::ScopedLock g(child_thread_lock_);
     if (is_stopped()) return;
     stopped_gen_ += 1;
+    // Only a stop the guest asked for is its parent's business. The LibOS
+    // also stops a process for its own purposes -- the parent of a vfork()
+    // until the child execs, a snapshot -- and Linux has no counterpart to
+    // those: reported, they reach the parent as SIGCHLD (CLD_STOPPED, then
+    // CLD_CONTINUED) for every command a child shell runs, interrupting
+    // whatever it was waiting in.
+    stop_is_guest_visible_ = user_sig;
     SignalAllThreads(SIGSTOP);
     if (user_sig) stop_cnt_++;
   }
@@ -851,7 +888,7 @@ class Process : public std::enable_shared_from_this<Process> {
     if (!is_stopped()) return;
     stopped_gen_ += 1;
     stopped_threads_.WakeAll();
-    NotifyParentWait(kWaitableContinued);
+    if (stop_is_guest_visible_) NotifyParentWait(kWaitableContinued);
   }
 
   static Status<std::pair<std::shared_ptr<Process>, Thread *>> CreateInit(
@@ -1019,6 +1056,7 @@ class Process : public std::enable_shared_from_this<Process> {
   std::shared_ptr<MemoryMap> mem_map_;
 
   // Signal table
+  std::atomic_bool traceme_{false};
   SignalTable signal_tbl_;
 
   // Protected by shared_sig_q_lock_
@@ -1047,6 +1085,7 @@ class Process : public std::enable_shared_from_this<Process> {
   unsigned int stopped_count_{0};
   size_t stopped_gen_{0};
   size_t stop_cnt_{0};
+  bool stop_is_guest_visible_{false};  // protected by child_thread_lock_
 
   // Protected by parent_'s shared_sig_q_lock_
   std::shared_ptr<Process> parent_;
@@ -1055,6 +1094,7 @@ class Process : public std::enable_shared_from_this<Process> {
 
   // Timers
   ITimer it_real_{*this};
+  PosixTimerTable posix_timers_;
 
   // Counters
   Duration accumulated_runtime_{0};  // Time from exited threads.

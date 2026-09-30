@@ -10,10 +10,12 @@ add_library(fs
   linuxfs/linuxfile.cc
   linuxfs/linuxfs.cc
   memfs/memfs.cc
+  fsstat.cc
   memfs/dir.cc
   memfs/fifo.cc
   pipe.cc
   poll.cc
+  pty.cc
   procfs/procfs.cc
   stdiofile.cc
 )

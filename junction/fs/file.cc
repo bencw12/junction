@@ -16,6 +16,7 @@ extern "C" {
 #include "junction/base/io.h"
 #include "junction/bindings/log.h"
 #include "junction/fs/file.h"
+#include "junction/fs/fsstat.h"
 #include "junction/fs/fs.h"
 #include "junction/junction.h"
 #include "junction/kernel/ksys.h"
@@ -126,7 +127,13 @@ void FileTable::InsertAt(int fd, std::shared_ptr<File> f, bool cloexec) {
     rt::SpinGuard g(lock_);
     if (static_cast<size_t>(fd) >= farr_->len) Resize(fd + 1);
     tmp = farr_->files[fd].Replace(fd, std::move(f));
-    if (cloexec) close_on_exec_.set(fd);
+    // The flag belongs to the new descriptor, not the slot: dup2() onto an fd
+    // that had FD_CLOEXEC must clear it. apt marks every fd close-on-exec and
+    // then dup2()s the ones its child is meant to inherit.
+    if (cloexec)
+      close_on_exec_.set(fd);
+    else
+      close_on_exec_.clear(fd);
   }
 }
 
@@ -154,6 +161,7 @@ void FileTable::RemoveRange(int low, int high) {
   {
     rt::SpinGuard g(lock_);
     high = std::min(high, static_cast<int>(farr_->len) - 1);
+    if (high < low) return;  // the range lies beyond the table
     tmp.reserve(high - low + 1);
     for (int fd = low; fd <= high; fd++) {
       if (!farr_->files[fd]) continue;
@@ -166,6 +174,7 @@ void FileTable::RemoveRange(int low, int high) {
 void FileTable::SetCloseOnExecRange(size_t low, size_t high) {
   rt::SpinGuard g(lock_);
 
+  if (!farr_->len) return;
   high = std::min(high, farr_->len - 1);
   for (size_t fd = low; fd <= high; fd++)
     if (farr_->files[fd]) close_on_exec_.set(fd);
@@ -213,12 +222,19 @@ long usys_ftruncate(int fd, off_t length) {
   return 0;
 }
 
+// A read or write that a signal interrupts before any data moved is restarted,
+// not failed, unless a handler without SA_RESTART actually ran: EINTR becomes
+// ERESTARTSYS here and the signal-delivery path decides. Returning EINTR for
+// every signal meant a SIGCHLD nobody handles broke a blocking read -- a Tcl
+// interpreter reading its child's output through a pipe saw the child's exit
+// as a read error (sqlite's configure: "Error: ", and nothing else).
 ssize_t usys_read(int fd, void *buf, size_t len) {
   FileTable &ftbl = myproc().get_file_table();
   File *f = ftbl.Get(fd);
   if (unlikely(!f || !f->is_readable())) return -EBADF;
   Status<size_t> ret = f->Read(readable_span(buf, len), &f->get_off_ref());
-  if (!ret) return MakeCError(ret);
+  if (!ret) return MakeCErrorRestartSys(ret);
+  FsStatNoteIo(f, *ret, false);
   return static_cast<ssize_t>(*ret);
 }
 
@@ -228,7 +244,8 @@ ssize_t usys_readv(int fd, struct iovec *iov, int iovcnt) {
   if (unlikely(!f || !f->is_readable())) return -EBADF;
   Status<size_t> ret =
       f->Readv({iov, static_cast<size_t>(iovcnt)}, &f->get_off_ref());
-  if (!ret) return MakeCError(ret);
+  if (!ret) return MakeCErrorRestartSys(ret);
+  FsStatNoteIo(f, *ret, false);
   return static_cast<ssize_t>(*ret);
 }
 
@@ -237,7 +254,8 @@ ssize_t usys_write(int fd, const void *buf, size_t len) {
   File *f = ftbl.Get(fd);
   if (unlikely(!f || !f->is_writeable())) return -EBADF;
   Status<size_t> ret = f->Write(writable_span(buf, len), &f->get_off_ref());
-  if (!ret) return MakeCError(ret);
+  if (!ret) return MakeCErrorRestartSys(ret);
+  FsStatNoteIo(f, *ret, true);
   return static_cast<ssize_t>(*ret);
 }
 
@@ -247,6 +265,7 @@ ssize_t usys_pread64(int fd, void *buf, size_t len, off_t offset) {
   if (unlikely(!f || !f->is_readable())) return -EBADF;
   Status<size_t> ret = f->Read(readable_span(buf, len), &offset);
   if (!ret) return MakeCError(ret);
+  FsStatNoteIo(f, *ret, false);
   return static_cast<ssize_t>(*ret);
 }
 
@@ -319,8 +338,10 @@ long DoFlocks(File *f, unsigned long op, struct flock *fl) {
       break;
     case F_SETLKW:
       ret = ctx.DoSet(fl, true, f);
+      break;
     case F_GETLK:
       ret = ctx.DoGet(fl, f);
+      break;
     default:
       return -EINVAL;
   }
@@ -422,6 +443,20 @@ template <typename ConvertFn>
 Status<long> DoDirent(IDir &dir, std::span<std::byte> dirp, off_t &off,
                       ConvertFn func) {
   std::vector<dir_entry> ents = dir.GetDents();
+  // "." and "..", which every directory lists first. Their absence is mostly
+  // cosmetic -- but some code counts on them: R builds a package's C sources
+  // only if length(dir("src", all.files = TRUE)) > 2, so a src/ holding two
+  // files looked empty, nothing was compiled, and every package with native
+  // code failed to load ("shared object 'x.so' not found").
+  {
+    dir_entry dot = ents.empty() ? dir_entry{} : ents.front();
+    dot.name = ".";
+    dot.inum = dir.get_inum();
+    dot.type = kTypeDirectory;
+    dir_entry dotdot = dot;
+    dotdot.name = "..";
+    ents.insert(ents.begin(), {dot, dotdot});
+  }
   std::span<std::byte> out = dirp;
   while (static_cast<size_t>(off) < ents.size()) {
     size_t sz = func(ents[off], out, off);
@@ -489,7 +524,8 @@ ssize_t usys_writev(int fd, const iovec *iov, int iovcnt) {
   if (unlikely(!f || !f->is_writeable())) return -EBADF;
   Status<size_t> ret =
       f->Writev({iov, static_cast<size_t>(iovcnt)}, &f->get_off_ref());
-  if (!ret) return MakeCError(ret);
+  if (!ret) return MakeCErrorRestartSys(ret);
+  FsStatNoteIo(f, *ret, true);
   return static_cast<ssize_t>(*ret);
 }
 
@@ -500,6 +536,7 @@ ssize_t usys_pwritev(int fd, const iovec *iov, int iovcnt, off_t offset) {
   if (unlikely(!f || !f->is_writeable())) return -EBADF;
   Status<size_t> ret = f->Writev({iov, static_cast<size_t>(iovcnt)}, &offset);
   if (!ret) return MakeCError(ret);
+  FsStatNoteIo(f, *ret, true);
   return static_cast<ssize_t>(*ret);
 }
 
@@ -513,6 +550,7 @@ ssize_t usys_pwritev2(int fd, const iovec *iov, int iovcnt, off_t offset,
   if (unlikely(!f || !f->is_writeable())) return -EBADF;
   Status<size_t> ret = f->Writev({iov, static_cast<size_t>(iovcnt)}, &offset);
   if (!ret) return MakeCError(ret);
+  FsStatNoteIo(f, *ret, true);
   return static_cast<ssize_t>(*ret);
 }
 
@@ -522,6 +560,7 @@ ssize_t usys_pwrite64(int fd, const void *buf, size_t len, off_t offset) {
   if (unlikely(!f || !f->is_writeable())) return -EBADF;
   Status<size_t> ret = f->Write(writable_span(buf, len), &offset);
   if (!ret) return MakeCError(ret);
+  FsStatNoteIo(f, *ret, true);
   return static_cast<ssize_t>(*ret);
 }
 
@@ -534,13 +573,71 @@ ssize_t usys_sendfile(int out_fd, int in_fd, off_t *offset, size_t count) {
   if (unlikely(!fin || !fin->is_readable() ||
                fin->get_type() == FileType::kSocket))
     return -EBADF;
-  std::vector<std::byte> buf(count);
+  // count is a ceiling, not a size: callers copying a whole file pass
+  // 0x7ffff000 and expect the call to stop at end of file. Copy through a
+  // bounded buffer and write only what was read -- this used to allocate count
+  // bytes and then write all of them, read or not.
+  // Below glibc's mmap threshold: a LibOS allocation must come from memory
+  // every address space already maps.
+  constexpr size_t kChunk = 64UL << 10;
+  std::vector<std::byte> buf(std::min(count, kChunk));
   off_t &off = offset ? *offset : fin->get_off_ref();
-  Status<size_t> ret = fin->Read(buf, &off);
-  if (!ret) return MakeCError(ret);
-  ret = fout->Write(buf, &fout->get_off_ref());
-  if (!ret) return MakeCError(ret);
-  return static_cast<ssize_t>(*ret);
+  size_t total = 0;
+  while (total < count) {
+    size_t want = std::min(buf.size(), count - total);
+    Status<size_t> in = fin->Read(std::span(buf.data(), want), &off);
+    if (!in) return total ? static_cast<ssize_t>(total) : MakeCError(in);
+    if (*in == 0) break;
+    size_t done = 0;
+    while (done < *in) {
+      Status<size_t> out = fout->Write(
+          std::span<const std::byte>(buf.data() + done, *in - done),
+          &fout->get_off_ref());
+      if (!out) return total ? static_cast<ssize_t>(total) : MakeCError(out);
+      if (*out == 0) return static_cast<ssize_t>(total);
+      done += *out;
+      total += *out;
+    }
+    // A short read means no more is available right now (a pipe, or EOF on
+    // the next call); report what was moved rather than block for the rest.
+    if (*in < want) break;
+  }
+  return static_cast<ssize_t>(total);
+}
+
+// splice() without the zero-copy: one read of whatever is available, written
+// out in full. GNU grep drains its input this way when its output is
+// /dev/null, and reports ENOSYS as an error on the input.
+ssize_t usys_splice(int fd_in, off_t *off_in, int fd_out, off_t *off_out,
+                    size_t len, [[maybe_unused]] unsigned int flags) {
+  FileTable &ftbl = myproc().get_file_table();
+  File *fin = ftbl.Get(fd_in);
+  File *fout = ftbl.Get(fd_out);
+  if (unlikely(!fin || !fout || !fin->is_readable() || !fout->is_writeable()))
+    return -EBADF;
+  // One end has to be a pipe, which has no offset to pass. Pipes have no file
+  // type of their own here; they are special files, as devices are.
+  bool in_reg = fin->get_type() == FileType::kNormal;
+  bool out_reg = fout->get_type() == FileType::kNormal;
+  if (in_reg && out_reg) return -EINVAL;
+  if ((!in_reg && off_in) || (!out_reg && off_out)) return -ESPIPE;
+  if (len == 0) return 0;
+
+  constexpr size_t kChunk = 64UL << 10;
+  std::vector<std::byte> buf(std::min(len, kChunk));
+  Status<size_t> in =
+      fin->Read(std::span(buf), off_in ? off_in : &fin->get_off_ref());
+  if (!in) return MakeCErrorRestartSys(in);
+  size_t done = 0;
+  while (done < *in) {
+    Status<size_t> out =
+        fout->Write(std::span<const std::byte>(buf.data() + done, *in - done),
+                    off_out ? off_out : &fout->get_off_ref());
+    if (!out) return done ? static_cast<ssize_t>(done) : MakeCError(out);
+    if (*out == 0) break;
+    done += *out;
+  }
+  return static_cast<ssize_t>(done);
 }
 
 off_t usys_lseek(int fd, off_t offset, int whence) {
@@ -708,9 +805,18 @@ long usys_fcntl(int fd, unsigned int cmd, unsigned long arg) {
   }
 }
 
-long usys_close_range(int first, int last, unsigned int flags) {
+// The bounds are unsigned: close_range(3, ~0U, 0) is how "everything from 3
+// up" is spelled -- by glibc's closefrom(), and so by every posix_spawn with
+// POSIX_SPAWN_CLOSEFROM, which is what Python's subprocess uses. As ints that
+// last was -1 and the call was refused.
+long usys_close_range(unsigned int ufirst, unsigned int ulast,
+                      unsigned int flags) {
   if (unlikely(flags & ~CLOSE_RANGE_CLOEXEC)) return -EINVAL;
-  if (unlikely(first < 0 || last < first)) return -EINVAL;
+  if (unlikely(ulast < ufirst)) return -EINVAL;
+  if (ufirst > static_cast<unsigned int>(INT_MAX)) return 0;  // no such fds
+  const int first = static_cast<int>(ufirst);
+  const int last = static_cast<int>(
+      std::min(ulast, static_cast<unsigned int>(INT_MAX)));
   FileTable &ftbl = myproc().get_file_table();
   if (flags & CLOSE_RANGE_CLOEXEC)
     ftbl.SetCloseOnExecRange(first, last);
@@ -729,7 +835,11 @@ bool DoFileTableIoctls(FileTable &ftbl, int fd, unsigned long request) {
   return true;
 }
 
-long usys_ioctl(int fd, unsigned int request, char *argp) {
+// The third argument is whatever the request says it is: a pointer for most,
+// a plain integer for some (TIOCGPTPEER takes open flags). As a char * the
+// strace printer took it for a string and dereferenced 0x102.
+long usys_ioctl(int fd, unsigned int request, void *arg) {
+  char *argp = static_cast<char *>(arg);
   FileTable &ftbl = myproc().get_file_table();
   File *f = ftbl.Get(fd);
   if (unlikely(!f)) return -EBADF;

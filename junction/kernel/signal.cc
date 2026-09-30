@@ -556,7 +556,12 @@ void ThreadSignalHandler::DeliverKernelSigToUser(int signo,
   if (likely(!is_sig_blocked(signo)))
     tmp = GetAction(signo);
   else
-    LOG(WARN) << "synchronous signal blocked";
+    LOG(WARN) << "synchronous signal " << signo << " blocked (pid "
+              << myth.get_process().get_pid() << ", rip " << std::hex
+              << sigframe.GetFrame().uc.uc_mcontext.rip << " addr "
+              << sigframe.GetFrame().uc.uc_mcontext.cr2 << std::dec << " as "
+              << GetActiveAddressSpace() << " want_as "
+              << myth.get_process().get_mem_map().get_as_handle() << ")";
 
   // synchronous signal kills program if no action is specified.
   if (!tmp || tmp->handler == SigKillHandler)
@@ -747,7 +752,36 @@ extern "C" void synchronous_signal_handler(int signo, siginfo_t *info,
                << " rsp=" << uc->uc.uc_mcontext.rsp << std::dec
                << " pid=" << myth.get_process().get_pid()
                << " as=" << GetActiveAddressSpace() << " want_as="
-               << myth.get_process().get_mem_map().get_as_handle();
+               << myth.get_process().get_mem_map().get_as_handle()
+               << " kernel_as=" << QueryBoundAddressSpace();
+      {
+        // If the rip is ours, this is what addr2line needs.
+        extern char __executable_start[], etext[];
+        uintptr_t rip = uc->uc.uc_mcontext.rip;
+        auto lo = reinterpret_cast<uintptr_t>(__executable_start);
+        if (rip >= lo && rip < reinterpret_cast<uintptr_t>(etext)) {
+          LOG(ERR) << "  rip is in the LibOS: junction_run+0x" << std::hex
+                   << (rip - lo) << std::dec;
+          auto *sp = reinterpret_cast<uintptr_t *>(uc->uc.uc_mcontext.rsp);
+          int shown = 0;
+          for (int i = 0; i < 256 && shown < 16; i++) {
+            uintptr_t w = sp[i];
+            if (w >= lo && w < reinterpret_cast<uintptr_t>(etext)) {
+              LOG(ERR) << "    [rsp+" << i * 8 << "] junction_run+0x" << std::hex
+                       << (w - lo) << std::dec;
+              shown++;
+            }
+          }
+        }
+      }
+      {
+        uintptr_t pg = reinterpret_cast<uintptr_t>(info->si_addr) & ~0xfffUL;
+        long probe = ksyscall(__NR_madvise, reinterpret_cast<void *>(pg), 4096,
+                              MADV_NORMAL);
+        LOG(ERR) << "  page " << std::hex << pg << std::dec
+                 << (probe == 0 ? " IS mapped here" : " is NOT mapped here")
+                 << " (madvise=" << probe << "), si_code=" << info->si_code;
+      }
       // Try to cleanly kill this program.
       if (prev_tf) SynchronousKill(myth, *prev_tf);
       print_msg_abort("signal delivered while preemption is disabled");
@@ -1010,7 +1044,16 @@ extern "C" void on_sched(thread_t *th) {
   // Put this core in the guest's address space. Threads of the same process
   // share one, so switching between them costs a comparison and nothing else;
   // only moving a core between processes reaches the kernel.
-  ActivateAddressSpace(myth.get_process().get_mem_map().get_as_handle());
+  Process &proc = myth.get_process();
+  const uint64_t want = proc.get_mem_map().get_as_handle();
+  if (unlikely(!TryActivateAddressSpace(want))) {
+    // Say whose it was before ActivateAddressSpace() gives up on it.
+    LOG(ERR) << "on_sched: pid " << proc.get_pid() << " tid " << myth.get_tid()
+             << " (" << proc.get_mem_map().get_cmd_line() << ") lives in address space "
+             << want << ", which no longer exists; exited="
+             << proc.exited() << " vfork_preexec=" << proc.in_vfork_preexec();
+    ActivateAddressSpace(want);
+  }
   myth.get_rseq().fixup(myth);
 }
 
@@ -1265,6 +1308,17 @@ long usys_pause() {
 extern "C" void RunSignals(long rax) {
   assert_stack_is_aligned();
   Thread &th = mythread();
+
+  // Reached with nothing pending only when the return path saw a restart code
+  // about to go out to the guest (entry.S): an interruptible wait was broken,
+  // and whatever broke it has been dealt with since. There is no signal to
+  // deliver and this is not the state DeliverSignals() restarts system calls
+  // from, so the call simply reports that it was interrupted -- which is true,
+  // and which callers retry -- instead of leaking -ERESTARTNOHAND.
+  if (unlikely(IsRestartSys(rax) && !th.needs_interrupt())) {
+    th.GetSyscallFrame().SetRax(-EINTR, std::nullopt);
+    return;
+  }
   th.get_sighand().DeliverSignals(th.GetTrapframe(), rax);
 }
 

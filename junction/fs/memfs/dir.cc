@@ -15,6 +15,7 @@ Status<std::shared_ptr<DirectoryEntry>> MemIDir::LookupMissLocked(
 }
 
 Status<void> MemIDir::MkNod(std::string_view name, mode_t mode, dev_t dev) {
+  TouchMtime();
   DoInitCheck();
   if ((mode & kTypeMask) == kTypeFIFO)
     return Insert(std::string(name), CreateIFifo(mode));
@@ -24,12 +25,14 @@ Status<void> MemIDir::MkNod(std::string_view name, mode_t mode, dev_t dev) {
 }
 
 Status<void> MemIDir::MkDir(std::string_view name, mode_t mode) {
+  TouchMtime();
   DoInitCheck();
   rt::ScopedLock g(lock_);
   return AddIDirLocked<MemIDir>(std::string(name), mode);
 }
 
 Status<void> MemIDir::Unlink(std::string_view name) {
+  TouchMtime();
   DoInitCheck();
   rt::ScopedLock g(lock_);
   Status<DirectoryEntry *> dent = FindRaw(name);
@@ -41,6 +44,7 @@ Status<void> MemIDir::Unlink(std::string_view name) {
 }
 
 Status<void> MemIDir::Unlink(DirectoryEntry *dent) {
+  TouchMtime();
   DoInitCheck();
   rt::ScopedLock g(lock_);
   Status<std::shared_ptr<IDir>> dir = dent->get_parent_dir();
@@ -50,6 +54,7 @@ Status<void> MemIDir::Unlink(DirectoryEntry *dent) {
 }
 
 Status<void> MemIDir::RmDir(std::string_view name) {
+  TouchMtime();
   DoInitCheck();
   rt::ScopedLock g(lock_);
   Status<DirectoryEntry *> dent = FindRaw(name);
@@ -71,12 +76,15 @@ Status<void> MemIDir::RmDir(std::string_view name) {
 }
 
 Status<void> MemIDir::SymLink(std::string_view name, std::string_view target) {
+  TouchMtime();
   DoInitCheck();
   return Insert(std::string(name), CreateISoftLink(std::string(target)));
 }
 
 Status<void> MemIDir::Rename(IDir &src, std::string_view src_name,
                              std::string_view dst_name, bool replace) {
+  TouchMtime();
+  src.TouchMtime();
   DoInitCheck();
   if (src.get_idir_type() != IDirType::kMem) return MakeError(EXDEV);
   MemIDir *src_dir = static_cast<MemIDir *>(&src);
@@ -103,6 +111,7 @@ Status<void> MemIDir::Rename(IDir &src, std::string_view src_name,
 }
 
 Status<void> MemIDir::Link(std::string_view name, std::shared_ptr<Inode> ino) {
+  TouchMtime();
   DoInitCheck();
   rt::ScopedLock g(lock_);
   if (is_stale()) return MakeError(ESTALE);

@@ -3,7 +3,9 @@
 #include <errno.h>
 #include <linux/audit.h>
 #include <linux/filter.h>
+#include <linux/futex.h>
 #include <linux/seccomp.h>
+#include <sys/uio.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -43,7 +45,9 @@ static struct sock_filter caladan_filter[] = {
 static struct sock_filter writeable_linux_fs[] = {
     ALLOW_JUNCTION_SYSCALL(mkdirat),   ALLOW_JUNCTION_SYSCALL(linkat),
     ALLOW_JUNCTION_SYSCALL(unlinkat),  ALLOW_JUNCTION_SYSCALL(renameat2),
-    ALLOW_JUNCTION_SYSCALL(symlinkat), ALLOW_JUNCTION_SYSCALL(truncate)};
+    ALLOW_JUNCTION_SYSCALL(symlinkat), ALLOW_JUNCTION_SYSCALL(truncate),
+    ALLOW_JUNCTION_SYSCALL(fchmodat),
+    ALLOW_JUNCTION_SYSCALL(fchownat)};
 
 // Syscalls needed to query dents/inodes in the host fs at runtime.
 static struct sock_filter uncached_linux_fs[] = {
@@ -76,6 +80,9 @@ static struct sock_filter junction_core[] = {
     ALLOW_JUNCTION_SYSCALL(munmap),
     ALLOW_JUNCTION_SYSCALL(mprotect),
     ALLOW_JUNCTION_SYSCALL(madvise),
+    // Hole punches in the arena's and memfs's memfds. They go through the fd
+    // because the address space that frees a range need not have it mapped.
+    ALLOW_JUNCTION_SYSCALL(fallocate),
     ALLOW_JUNCTION_SYSCALL(openat),
     ALLOW_JUNCTION_SYSCALL(close),
     ALLOW_JUNCTION_SYSCALL(preadv2),
@@ -253,6 +260,42 @@ extern "C" void syscall_trap_handler(int nr, siginfo_t *info,
       ctx->uc_mcontext.rax = -ENOSYS;
       log_syscall_msg("blocked syscall (likely from inside Junction's libc): ",
                       sysn);
+      // glibc announces why it is about to abort() -- a failed assertion, heap
+      // corruption, a terminate() -- with writev(2, ...), and
+      // backtrace_symbols_fd() writes a fatal assertion's callers the same
+      // way to fd 1. Those lines say what went wrong in the LibOS; let them
+      // through.
+      if (sysn == __NR_writev && (ctx->uc_mcontext.rdi == STDERR_FILENO ||
+                                  ctx->uc_mcontext.rdi == STDOUT_FILENO)) {
+        auto *iov = reinterpret_cast<const struct iovec *>(ctx->uc_mcontext.rsi);
+        unsigned long cnt = ctx->uc_mcontext.rdx;
+        for (unsigned long i = 0; iov && i < cnt && i < 16; i++)
+          ksys_write(STDOUT_FILENO, iov[i].iov_base, iov[i].iov_len);
+      }
+      return;
+    }
+
+    // Junction's own glibc waiting on one of its internal locks -- malloc's,
+    // mostly: there is one arena (see main()), and LibOS threads on several
+    // cores contend for it. The host futex is not an option: glibc's are
+    // private futexes, keyed by (mm, address), so a wake from a core bound to
+    // another address space would never arrive; and the filter refuses it,
+    // which glibc answers with "The futex facility returned an unexpected
+    // error code" and abort(). Answer here instead. A wait returns after a
+    // short pause -- a spurious wakeup, which the futex contract allows and
+    // every glibc waiter re-checks for in a loop -- and a wake has nobody
+    // asleep to wake. Contended LibOS locks become spin-waits.
+    if (sysn == __NR_futex) {
+      int op = static_cast<int>(ctx->uc_mcontext.rsi) & FUTEX_CMD_MASK;
+      if (op == FUTEX_WAIT || op == FUTEX_WAIT_BITSET) {
+        for (int i = 0; i < 64; i++) cpu_relax();
+        ctx->uc_mcontext.rax = 0;
+      } else if (op == FUTEX_WAKE || op == FUTEX_WAKE_BITSET) {
+        ctx->uc_mcontext.rax = 0;
+      } else {
+        // PI and requeue operations transfer ownership; "0" would be a lie.
+        ctx->uc_mcontext.rax = static_cast<unsigned long>(-ENOSYS);
+      }
       return;
     }
 

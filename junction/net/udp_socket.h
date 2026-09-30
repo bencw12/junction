@@ -139,7 +139,10 @@ class UDPSocket : public IPSocket {
 
   Status<void> LocalAddr(SockAddrPtr laddr) const override {
     assert(laddr);
-    if (unlikely(!conn_.is_valid())) return MakeError(EINVAL);
+    if (!conn_.is_valid()) {  // not bound yet: 0.0.0.0:0, as Linux reports
+      laddr.FromNetAddr(netaddr{0, 0});
+      return {};
+    }
     Status<netaddr> ret = conn_.LocalAddr();
     if (unlikely(!ret)) return MakeError(ret);
     laddr.FromNetAddr(*ret);
@@ -172,6 +175,14 @@ class UDPSocket : public IPSocket {
  private:
   void SetupPollSource() override {
     PollSource &s = get_poll_source();
+    // A socket that is polled before it is bound or sent on has no connection
+    // to install on; InstallConn() installs when one arrives. Until then it
+    // is writable and nothing else, which is what Linux reports -- glibc's
+    // resolver polls for POLLOUT before its first send.
+    if (!conn_.is_valid()) {
+      s.Set(POLLOUT);
+      return;
+    }
     conn_.InstallPollSource(PollSourceSet, PollSourceClear,
                             reinterpret_cast<unsigned long>(&s));
   }

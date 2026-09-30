@@ -18,6 +18,7 @@ extern "C" {
 #include "junction/bindings/log.h"
 #include "junction/fs/junction_file.h"
 #include "junction/junction.h"
+#include "junction/kernel/as.h"
 #include "junction/kernel/elf.h"
 #include "junction/kernel/exec.h"
 #include "junction/kernel/usys.h"
@@ -166,8 +167,18 @@ struct ExecContext {
     return argv_view_;
   }
 
-  void PrependArgs(std::vector<std::string_view> &tokens) {
+  // Turns the arguments of a script into those of its interpreter: argv[0]
+  // becomes the script's pathname, as it was given to execve(), and the
+  // interpreter line goes in front. The pathname is how the interpreter finds
+  // the script; argv[0] is only what the caller chose to call it, which for a
+  // script found on PATH is a bare name that opens nothing.
+  void PrependArgs(std::vector<std::string_view> &tokens,
+                   std::string_view script_path) {
     TakeArgvOwnership();
+    if (argv_.empty())
+      argv_.emplace_back(script_path);
+    else
+      argv_[0] = std::string(script_path);
     argv_.insert(argv_.begin(), tokens.begin(), tokens.end());
   }
 
@@ -185,7 +196,7 @@ struct ExecContext {
 };
 
 Status<void> ResolveElf(std::shared_ptr<DirectoryEntry> dent, ExecContext &ctx,
-                        bool must_be_reloc,
+                        std::string_view pathname, bool must_be_reloc,
                         size_t max_depth = kMaxInterpFollow) {
   Status<JunctionFile> file =
       JunctionFile::Open(std::move(dent), 0, FileMode::kRead);
@@ -202,18 +213,43 @@ Status<void> ResolveElf(std::shared_ptr<DirectoryEntry> dent, ExecContext &ctx,
   file->Seek(0);
   StreamBufferReader r(*file, 256);
   std::istream instream(&r);
-  if (instream.get() != '#' || instream.get() != '!') return MakeError(EINVAL);
+  // Neither an ELF image nor a "#!" script: ENOEXEC, and it matters that it is
+  // exactly that. A shell that gets ENOEXEC from execve() runs the file with
+  // /bin/sh itself, which is how a script with no interpreter line works at
+  // all -- R's bin/INSTALL starts with a comment, not "#!". EINVAL made dash
+  // report "exec: .../INSTALL: Invalid argument" and every R package build
+  // fail.
+  if (instream.get() != '#' || instream.get() != '!') return MakeError(ENOEXEC);
 
+  // As Linux parses it: blanks after "#!" are skipped, the interpreter runs
+  // to the next blank, and whatever follows -- trimmed -- is a single optional
+  // argument. "#! /bin/sh" is common (Debian's maintainer scripts), and taking
+  // the text before its first space as the interpreter gave an empty name.
   std::string s;
   std::getline(instream, s);
-  std::vector<std::string_view> tokens = split(s, ' ', 1);
+  auto is_blank = [](char c) { return c == ' ' || c == '\t' || c == '\r'; };
+  std::string_view line(s);
+  while (!line.empty() && is_blank(line.front())) line.remove_prefix(1);
+  while (!line.empty() && is_blank(line.back())) line.remove_suffix(1);
+  if (line.empty()) return MakeError(ENOEXEC);
+  std::vector<std::string_view> tokens;
+  size_t cut = 0;
+  while (cut < line.size() && !is_blank(line[cut])) cut++;
+  tokens.push_back(line.substr(0, cut));
+  line.remove_prefix(cut);
+  while (!line.empty() && is_blank(line.front())) line.remove_prefix(1);
+  if (!line.empty()) tokens.push_back(line);
 
   Status<std::shared_ptr<DirectoryEntry>> path =
       LookupDirEntry(ctx.fs, tokens[0]);
   if (!path) return MakeError(path);
 
-  ctx.PrependArgs(tokens);
-  return ResolveElf(std::move(*path), ctx, must_be_reloc, max_depth - 1);
+  // tokens view into s, which PrependArgs copies; the interpreter's own path
+  // is copied too, since it names the script if that is a script in turn.
+  std::string interp(tokens[0]);
+  ctx.PrependArgs(tokens, pathname);
+  return ResolveElf(std::move(*path), ctx, interp, must_be_reloc,
+                    max_depth - 1);
 }
 
 Status<ExecInfo> FinishExec(MemoryMap &mm, ExecContext &ctx,
@@ -250,7 +286,7 @@ Status<ExecInfo> Exec(Process &p, MemoryMap &mm, std::string_view pathname,
   Status<std::shared_ptr<DirectoryEntry>> path =
       LookupDirEntry(ctx.fs, pathname);
   if (!path) return MakeError(path);
-  Status<void> ret = ResolveElf(std::move(*path), ctx, must_be_reloc);
+  Status<void> ret = ResolveElf(std::move(*path), ctx, pathname, must_be_reloc);
   if (!ret) return MakeError(ret);
 
   if (unlikely(GetCfg().strace_enabled())) {
@@ -260,6 +296,20 @@ Status<ExecInfo> Exec(Process &p, MemoryMap &mm, std::string_view pathname,
   }
 
   return FinishExec(mm, ctx, envp);
+}
+
+// Whether the address space @handle already holds a non-relocatable image,
+// other than @except's. With one address space per forked process, that -- not
+// how many such images exist in the container -- is what decides whether
+// another can be loaded at its fixed address.
+bool AddressSpaceHoldsFixedImage(uint64_t handle, const MemoryMap *except) {
+  bool found = false;
+  Process::ForEachProcess([&](Process &proc) {
+    MemoryMap &m = proc.get_mem_map();
+    if (&m != except && m.is_non_reloc() && m.get_as_handle() == handle)
+      found = true;
+  });
+  return found;
 }
 
 long DoExecve(std::shared_ptr<DirectoryEntry> dent, const char *filename,
@@ -293,8 +343,14 @@ long DoExecve(std::shared_ptr<DirectoryEntry> dent, const char *filename,
     if (nr_non_reloc && old_mm.is_non_reloc() && !p.in_vfork_preexec())
       nr_non_reloc--;
 
+    // With per-process address spaces the container-wide count says nothing:
+    // what matters is the address space the image will be loaded into, and
+    // that is settled below, once the image's type is known.
+    const bool mas = MultiAddressSpaceEnabled();
+
     ExecContext ctx(p.get_fs(), argv_s);
-    Status<void> ret = ResolveElf(std::move(dent), ctx, nr_non_reloc > 0);
+    Status<void> ret =
+        ResolveElf(std::move(dent), ctx, filename, !mas && nr_non_reloc > 0);
     if (!ret) return MakeCError(ret);
 
     std::vector<std::string_view> envp_view;
@@ -302,9 +358,90 @@ long DoExecve(std::shared_ptr<DirectoryEntry> dent, const char *filename,
 
     // We are replacing a non-reloc MM with another non-reloc MM.
     // We need to free existing memory first, since it may overlap.
-    bool replace_non_reloc =
-        old_mm.is_non_reloc() && ctx.hdr.type != kETypeDynamic;
-    if (replace_non_reloc) {
+    // Replacing in place frees the old image first, which is only ours to
+    // free if we are not borrowing it: a vfork child's map is its parent's.
+    // (The container-wide count used to keep a vfork child from getting here.)
+    bool replace_non_reloc = old_mm.is_non_reloc() &&
+                             ctx.hdr.type != kETypeDynamic &&
+                             !p.in_vfork_preexec();
+    // A non-relocatable image needs its fixed addresses free. They are, unless
+    // this address space already holds such an image that is not ours to
+    // replace: a vfork child's parent's (python spawning python through
+    // posix_spawn), or another process exec'd into this same space. Then the
+    // process moves into an address space of its own first -- a clone with
+    // every guest's memory left out, since exec keeps none of it.
+    bool promoted = false;
+    // Claimed, not looked up: the claim is atomic, and it is held by whichever
+    // map has such an image until that image is really gone (see
+    // MemoryMap::ClaimFixedImageSlot).
+    if (mas && ctx.hdr.type != kETypeDynamic && !replace_non_reloc &&
+        !(*mm)->ClaimFixedImageSlot()) {
+      // Everything exec still needs from the old memory, copied out of it.
+      ctx.TakeArgvOwnership();
+      ptr = envp;
+      while (*ptr) envp_s.emplace_back(*ptr++);
+      envp_view.reserve(envp_s.size());
+      envp_view.insert(envp_view.end(), envp_s.begin(), envp_s.end());
+      if (unlikely(GetCfg().strace_enabled()))
+        LogSyscallDirect("execve", (strace::PathName *)filename, argv, envp);
+
+      Status<uint64_t> as;
+      {
+        rt::MutexGuard fg(AddressSpaceForkLock());
+        // The same exclusions a fork of the caller would use: its own region
+        // stays in (and is dropped from the new space below). Marking a region
+        // MADV_DONTFORK while its owner lives in this address space is not
+        // something fork ever does, and the owner did not survive it.
+        std::vector<AddressRange> exclude =
+            MemoryMap::GetOtherGuestRegions(old_mm.get_reservation());
+        as = CloneCurrentAddressSpace(exclude);
+      }
+      if (!as) return MakeCError(as);
+
+      // The new map's region was reserved in the space we are leaving, before
+      // it was known that we would leave. The clone has its own copy of that
+      // reservation; this one would outlive the process -- a space that dies
+      // with its last map unmaps nothing -- and collide with whoever is given
+      // the region next.
+      {
+        AddressRange resv = (*mm)->get_reservation();
+        Status<void> um = KernelMUnmap(reinterpret_cast<void *>(resv.start),
+                                       resv.Length());
+        if (!um) LOG(WARN) << "exec: stale reservation left behind " << um.error();
+      }
+
+      // From here the old memory is gone for this thread: %fs must stop
+      // pointing into it, and the scheduler must bind this process's threads
+      // to the new space even if the load below blocks.
+      SetFSBase(perthread_read(runtime_fsbase));
+      myth.get_rseq().reset();
+      (*mm)->OwnAddressSpace(*as);
+      // A new address space: its slot is free, and now ours.
+      if (unlikely(!(*mm)->ClaimFixedImageSlot()))
+        LOG(ERR) << "exec: fixed-image slot of a new address space is taken";
+      // Keep the old map alive until we are done with it below: for a forked
+      // process this is its last reference, and @old_mm refers to it.
+      std::shared_ptr<MemoryMap> old_keep = p.AdoptMemoryMap(*mm);
+      // With preemption off: the binding and the per-core record of it must
+      // change together. A migration between the two leaves a core bound to
+      // the new space while recording the old one, and the next thread that
+      // wants the old one -- the vfork parent -- skips the switch and runs
+      // where its memory does not exist.
+      rt::Preempt::Lock();
+      ActivateAddressSpace(*as);
+      rt::Preempt::Unlock();
+      // The clone carried a copy of the caller's memory, fixed image
+      // included. None of it survives an exec; drop it from this space.
+      old_mm.UnmapInheritedCopyHere();
+      // And whatever of other guests' memory the clone picked up (see
+      // SweepClonedAddressSpace). Ours, in it, is the new map's reservation.
+      SweepClonedAddressSpace(
+          *as, MemoryMap::GetOtherGuestRegions((*mm)->get_reservation()));
+      // Now the old map may go. Its destructor visits or releases the space
+      // we left and comes back to this one.
+      old_keep.reset();
+      promoted = true;
+    } else if (replace_non_reloc) {
       // Log while the memory is still available.
       if (unlikely(GetCfg().strace_enabled()))
         LogSyscallDirect("execve", (strace::PathName *)filename, argv, envp);
@@ -322,6 +459,8 @@ long DoExecve(std::shared_ptr<DirectoryEntry> dent, const char *filename,
       // preemption occurs).
       myth.get_rseq().reset();
       old_mm.UnmapAll();
+      // Same address space, same addresses: the slot passes to the new map.
+      MemoryMap::TransferFixedImageSlot(old_mm, **mm);
     } else {
       ptr = envp;
       while (*ptr) envp_view.emplace_back(*ptr++);
@@ -329,7 +468,7 @@ long DoExecve(std::shared_ptr<DirectoryEntry> dent, const char *filename,
 
     Status<ExecInfo> regs = FinishExec(**mm, ctx, envp_view);
     if (!regs) {
-      if (replace_non_reloc) {
+      if (replace_non_reloc || promoted) {
         LOG(ERR) << "failed to replace non-relocatable image";
         syscall_exit(-1);
       }
@@ -337,7 +476,7 @@ long DoExecve(std::shared_ptr<DirectoryEntry> dent, const char *filename,
     }
 
     // The syscall has suceeded.
-    if (unlikely(GetCfg().strace_enabled() && !replace_non_reloc))
+    if (unlikely(GetCfg().strace_enabled() && !replace_non_reloc && !promoted))
       LogSyscallDirect((long)0, std::string_view("execve"),
                        (strace::PathName *)filename, argv, envp);
 
@@ -357,7 +496,7 @@ long DoExecve(std::shared_ptr<DirectoryEntry> dent, const char *filename,
     //
     // The new map becomes one more holder of that space, not its owner: a
     // vfork child's parent is still living there.
-    (*mm)->ShareAddressSpaceOf(old_mm);
+    if (!promoted) (*mm)->ShareAddressSpaceOf(old_mm);
 
     // Dropping the old map unmaps the old image, and %fs still points into it:
     // a guest syscall runs on the guest's TCB, so any LibOS code that touches

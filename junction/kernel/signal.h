@@ -374,6 +374,17 @@ class alignas(kCacheLineSize) SignalTable {
     for (size_t i = 0; i < kNumSignals; i++) table_[i] = o.table_[i];
   }
 
+  // OnExec gives caught signals their default action, as execve() must: a
+  // handler is an address in the image being replaced. Ignored signals stay
+  // ignored. Without this a program started from a shell inherited the
+  // shell's SIGCHLD handler and jumped to it on its first child's exit.
+  void OnExec() {
+    rt::SpinGuard g(lock_);
+    for (size_t i = 0; i < kNumSignals; i++)
+      if (reinterpret_cast<uintptr_t>(table_[i].handler) != 1)  // SIG_IGN
+        table_[i].reset();
+  }
+
   // exchange_action sets a new action for a signal and returns the old one.
   k_sigaction exchange_action(int sig, k_sigaction sa) {
     assert_signal_valid(sig);

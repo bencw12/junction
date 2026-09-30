@@ -53,6 +53,25 @@ void CheckFrozenViolation(const char *op, uintptr_t addr, size_t len);
 
 inline constexpr int kMaxIovLen = 1024;  // Linux's max.
 
+// Touches a string the kernel is about to be given, and returns its address.
+//
+// LibOS memory is installed in an address space lazily: a core that touches a
+// page its address space has never seen faults, and the fault handler maps the
+// page in. That works for the LibOS's own accesses. It does not work for the
+// kernel's: given a pointer to such a page, copy_from_user() does not deliver a
+// fault we could repair, it fails the system call with EFAULT. A path string is
+// the case that happens -- with a writable host filesystem an inode, and the
+// path it caches, is created at run time by whichever process first names the
+// file, and used later by processes in other address spaces ("curl: error while
+// loading shared libraries: libz.so.1: cannot open shared object file: Error
+// 14", once a package upgrade run by another process had replaced the file).
+inline const char *KernelPath(std::string_view path) {
+  const volatile char *p = path.data();
+  for (size_t off = 0; off < path.size(); off += 4096) (void)p[off];
+  (void)p[path.size()];  // the terminator the kernel reads up to
+  return path.data();
+}
+
 #ifdef WRITEABLE_LINUX_FS
 constexpr bool linux_fs_writeable() { return true; }
 #else
@@ -166,13 +185,32 @@ static __always_inline long ksyscall(int sysnr) {
   return ksyscall(sysnr, arg1);
 }
 
+// Runs a host filesystem call again for as long as it reports EINTR. On an
+// ordinary filesystem these calls are never interrupted, but with the chroot
+// on overlayfs the first modification of a file from the lower layer -- an
+// open for writing, link, rename, chmod, chown, truncate -- copies it up, and
+// the copy gives up with EINTR when a signal is pending. The runtime preempts
+// with signals, so under core contention that is routine, and the guest sees
+// an error Linux would never give it ("dpkg: unable to make backup link ...:
+// Interrupted system call"). Bounded, in case a copy-up can never finish
+// between two preemptions.
+template <typename F>
+static __always_inline long KernelRetryEintr(F &&call) {
+  long ret;
+  int tries = 0;
+  do {
+    ret = call();
+  } while (unlikely(ret == -EINTR) && ++tries < 4096);
+  return ret;
+}
+
 // KernelFile provides a wrapper around a Linux FD.
 class KernelFile : public VectoredWriter {
  public:
   // Open creates a new file descriptor attached to a file path.
   static Status<KernelFile> Open(std::string_view path, int flags,
                                  FileMode fmode, mode_t mode = 0) {
-    int ret = ksys_open(path.data(), flags | ToFlags(fmode), mode);
+    int ret = KernelRetryEintr([&] { return ksys_open(KernelPath(path), flags | ToFlags(fmode), mode); });
     if (ret < 0) return MakeError(-ret);
     return KernelFile(ret);
   }
@@ -180,21 +218,21 @@ class KernelFile : public VectoredWriter {
   // Open creates a new file descriptor attached to a file path.
   static Status<KernelFile> Open(const char *path, int flags, FileMode fmode,
                                  mode_t mode = 0) {
-    int ret = ksys_open(path, flags | ToFlags(fmode), mode);
+    int ret = KernelRetryEintr([&] { return ksys_open(path, flags | ToFlags(fmode), mode); });
     if (ret < 0) return MakeError(-ret);
     return KernelFile(ret);
   }
 
   static Status<KernelFile> OpenAt(int fd, std::string_view path, int flags,
                                    FileMode fmode, mode_t mode = 0) {
-    int ret = ksys_openat(fd, path.data(), flags | ToFlags(fmode), mode);
+    int ret = KernelRetryEintr([&] { return ksys_openat(fd, KernelPath(path), flags | ToFlags(fmode), mode); });
     if (ret < 0) return MakeError(-ret);
     return KernelFile(ret);
   }
 
   Status<KernelFile> OpenAt(std::string_view path, int flags, FileMode fmode,
                             mode_t mode = 0) {
-    int ret = ksys_openat(fd_, path.data(), flags | ToFlags(fmode), mode);
+    int ret = KernelRetryEintr([&] { return ksys_openat(fd_, KernelPath(path), flags | ToFlags(fmode), mode); });
     if (ret < 0) return MakeError(-ret);
     return KernelFile(ret);
   }
@@ -277,35 +315,50 @@ class KernelFile : public VectoredWriter {
 
   inline Status<struct stat> StatAt(std::string_view path) {
     struct stat buf;
-    int ret = ksys_newfstatat(fd_, path.data(), &buf, AT_SYMLINK_NOFOLLOW);
+    int ret = ksys_newfstatat(fd_, KernelPath(path), &buf, AT_SYMLINK_NOFOLLOW);
     if (ret < 0) return MakeError(-ret);
     return buf;
   }
 
   Status<void> UnlinkAt(std::string_view path, int flags = 0) {
     if constexpr (!linux_fs_writeable()) return MakeError(EACCES);
-    int ret = ksyscall(__NR_unlinkat, fd_, path.data(), flags);
+    int ret = KernelRetryEintr([&] { return ksyscall(__NR_unlinkat, fd_, KernelPath(path), flags); });
     if (ret < 0) return MakeError(-ret);
     return {};
   }
 
   Status<std::string_view> ReadLinkAt(std::string_view path,
                                       std::span<char> buf) {
-    ssize_t wret = ksys_readlinkat(fd_, path.data(), buf.data(), buf.size());
+    ssize_t wret = ksys_readlinkat(fd_, KernelPath(path), buf.data(), buf.size());
     if (wret < 0) return MakeError(-wret);
     return {{buf.data(), static_cast<size_t>(wret)}};
   }
 
   Status<void> MkDirAt(std::string_view path, mode_t mode) {
     if constexpr (!linux_fs_writeable()) return MakeError(EACCES);
-    int ret = ksyscall(__NR_mkdirat, fd_, path.data(), mode);
+    int ret = KernelRetryEintr([&] { return ksyscall(__NR_mkdirat, fd_, KernelPath(path), mode); });
+    if (ret < 0) return MakeError(-ret);
+    return {};
+  }
+
+  Status<void> ChModAt(std::string_view path, mode_t mode) {
+    if constexpr (!linux_fs_writeable()) return {};
+    int ret = KernelRetryEintr([&] { return ksyscall(__NR_fchmodat, fd_, KernelPath(path), mode); });
+    if (ret < 0) return MakeError(-ret);
+    return {};
+  }
+
+  Status<void> ChOwnAt(std::string_view path, uid_t uid, gid_t gid) {
+    if constexpr (!linux_fs_writeable()) return {};
+    int ret = KernelRetryEintr([&] { return ksyscall(__NR_fchownat, fd_, KernelPath(path), uid, gid,
+                       AT_SYMLINK_NOFOLLOW); });
     if (ret < 0) return MakeError(-ret);
     return {};
   }
 
   Status<void> SymLinkAt(std::string_view target, std::string_view path) {
     if constexpr (!linux_fs_writeable()) return MakeError(EACCES);
-    int ret = ksyscall(__NR_symlinkat, target.data(), fd_, path.data());
+    int ret = KernelRetryEintr([&] { return ksyscall(__NR_symlinkat, KernelPath(target), fd_, KernelPath(path)); });
     if (ret < 0) return MakeError(-ret);
     return {};
   }
@@ -315,8 +368,8 @@ class KernelFile : public VectoredWriter {
                                bool replace) {
     if constexpr (!linux_fs_writeable()) return MakeError(EACCES);
     int flags = replace ? 0 : RENAME_NOREPLACE;
-    int ret = ksyscall(__NR_renameat2, olddir.fd_, oldpath.data(), newdir.fd_,
-                       newpath.data(), flags);
+    int ret = KernelRetryEintr([&] { return ksyscall(__NR_renameat2, olddir.fd_, KernelPath(oldpath), newdir.fd_,
+                       KernelPath(newpath), flags); });
     if (ret < 0) return MakeError(-ret);
     return {};
   }
@@ -324,8 +377,8 @@ class KernelFile : public VectoredWriter {
   static Status<void> LinkAt(KernelFile &olddir, std::string_view oldpath,
                              KernelFile &newdir, std::string_view newpath) {
     if constexpr (!linux_fs_writeable()) return MakeError(EACCES);
-    int ret = ksyscall(__NR_linkat, olddir.fd_, oldpath.data(), newdir.fd_,
-                       newpath.data(), 0);
+    int ret = KernelRetryEintr([&] { return ksyscall(__NR_linkat, olddir.fd_, KernelPath(oldpath), newdir.fd_,
+                       KernelPath(newpath), 0); });
     if (ret < 0) return MakeError(-ret);
     return {};
   }

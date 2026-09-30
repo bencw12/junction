@@ -1,7 +1,8 @@
 [submodule "lib/shenango"]
 	path = lib/caladan
-	url = https://github.com/shenango/caladan.git
+	url = https://github.com/bencw12/caladan.git
 	ignore = dirty
+	branch = junction-mas
 [submodule "lib/glibc"]
 	path = lib/glibc
 	url = https://github.com/bminor/glibc.git

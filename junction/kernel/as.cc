@@ -344,6 +344,13 @@ void ActivateAddressSpace(uint64_t handle) {
   perthread_store(active_as, handle);
 }
 
+uint64_t QueryBoundAddressSpace() {
+  if (as_dev_fd < 0) return 0;
+  uint64_t cur = ~0UL;
+  ksyscall(__NR_ioctl, as_dev_fd, JUNCTION_AS_CURRENT, &cur);
+  return cur;
+}
+
 bool TryActivateAddressSpace(uint64_t handle) {
   if (likely(perthread_read(active_as) == handle)) return true;
   if (unlikely(as_dev_fd < 0)) return true;
@@ -443,6 +450,22 @@ Status<uint64_t> CloneCurrentAddressSpace(
   RegisterAddressSpace(arg.handle);
   (void)ArenaGcSlot(arg.handle, inherited_gc_cursor);
   return static_cast<uint64_t>(arg.handle);
+}
+
+void SweepClonedAddressSpace(uint64_t handle,
+                             const std::vector<AddressRange> &stray) {
+  if (as_dev_fd < 0 || stray.empty()) return;
+  // A visit: preemption off for its length, as on_sched() would otherwise
+  // rebind the core to the running thread's own address space halfway.
+  rt::Preempt::Lock();
+  const uint64_t home = GetActiveAddressSpace();
+  if (home == handle || TryActivateAddressSpace(handle)) {
+    for (const AddressRange &r : stray)
+      ksyscall(__NR_munmap, reinterpret_cast<void *>(r.start), r.Length());
+    if (home != handle && !TryActivateAddressSpace(home))
+      ActivateAddressSpace(kRootAddressSpace);
+  }
+  rt::Preempt::Unlock();
 }
 
 size_t AuditLibOSMemory(bool log_details) {

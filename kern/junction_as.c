@@ -70,7 +70,6 @@ static struct mm_struct *(*p_mm_access)(struct task_struct *task,
 static void (*p_membarrier_update_current_mm)(struct mm_struct *next_mm);
 static void (*p_sched_mm_cid_before_execve)(struct task_struct *t);
 static void (*p_sched_mm_cid_after_execve)(struct task_struct *t);
-static void (*p_lru_gen_add_mm)(struct mm_struct *mm);
 static struct task_struct *(*p_find_get_task_by_vpid)(pid_t nr);
 static int (*p___pud_alloc)(struct mm_struct *mm, p4d_t *p4d,
 			    unsigned long address);
@@ -114,7 +113,6 @@ static int jas_resolve_symbols(void)
 		false);
 	RESOLVE(p_sched_mm_cid_after_execve, "sched_mm_cid_after_execve",
 		false);
-	RESOLVE(p_lru_gen_add_mm, "lru_gen_add_mm", false);
 	return 0;
 }
 
@@ -139,7 +137,11 @@ static int jas_resolve_symbols(void)
 struct jas_space {
 	struct mm_struct *mm;
 	u64 handle;
+	struct rcu_head rcu;		/* freed a grace period after release ... */
+	struct work_struct work;	/* ... and then in process context */
 };
+
+static struct workqueue_struct *jas_wq;
 
 #define JAS_HANDLE_ID(h)	((int)((h) & 0xffffffffULL))
 #define JAS_MAKE_HANDLE(gen, id) ((((u64)(gen)) << 32) | (u32)(id))
@@ -385,6 +387,7 @@ static long jas_share_range(struct jas_ctx *ctx, void __user *uarg)
  *   - active_mm always equals mm here, because the caller is always a user
  *     thread. None of the lazy-TLB refcounting in exec_mmap() applies.
  */
+/* Consumes the caller's user reference on @new_mm, whatever it returns. */
 static int jas_bind_mm(struct mm_struct *new_mm)
 {
 	struct task_struct *tsk = current;
@@ -394,13 +397,19 @@ static int jas_bind_mm(struct mm_struct *new_mm)
 		return -EINVAL;
 
 	old_mm = tsk->mm;
-	if (old_mm == new_mm)
+	if (old_mm == new_mm) {
+		mmput(new_mm);	/* already ours; the thread has its own */
 		return 0;
-	if (WARN_ON_ONCE(!old_mm))
+	}
+	if (WARN_ON_ONCE(!old_mm)) {
+		mmput(new_mm);
 		return -EINVAL;	/* kernel threads are not our business */
+	}
 
-	/* The thread's own reference on the mm it is about to run on. */
-	mmget(new_mm);
+	/*
+	 * The caller's reference becomes the thread's own reference on the mm
+	 * it is about to run on.
+	 */
 
 	if (p_sched_mm_cid_before_execve)
 		p_sched_mm_cid_before_execve(tsk);
@@ -426,6 +435,8 @@ static int jas_bind_mm(struct mm_struct *new_mm)
 /* ---------------------------------------------------------------------- */
 /* ioctl handlers                                                         */
 /* ---------------------------------------------------------------------- */
+
+static void jas_space_free_rcu(struct rcu_head *head);
 
 static long jas_adopt(struct jas_ctx *ctx, void __user *uarg)
 {
@@ -464,10 +475,12 @@ static long jas_adopt(struct jas_ctx *ctx, void __user *uarg)
 		return -ENOMEM;
 	}
 	sp->mm = mm;
+	mmgrab(mm);	/* the record's hold on the structure; see jas_space_free_rcu */
 
 	/* Give it the LibOS's page tables before anything can run on it. */
 	id = jas_share_into(ctx, mm);
 	if (id) {
+		mmdrop(mm);
 		kfree(sp);
 		mmput(mm);
 		return id;
@@ -479,37 +492,100 @@ static long jas_adopt(struct jas_ctx *ctx, void __user *uarg)
 		sp->handle = JAS_MAKE_HANDLE(++ctx->next_gen, id);
 	mutex_unlock(&ctx->lock);
 	if (id < 0) {
+		mmdrop(mm);
 		kfree(sp);
 		mmput(mm);
 		return id;
 	}
 
-	if (p_lru_gen_add_mm)
-		p_lru_gen_add_mm(mm);
+	/*
+	 * Do NOT lru_gen_add_mm(mm) here, as exec_mmap() does for the mm it
+	 * creates. This mm came from clone() without CLONE_VM, and kernel_clone()
+	 * already put it on the multi-gen LRU's mm_list. Adding it a second
+	 * time links the same list node twice; when the mm is later freed one
+	 * link is removed and the other keeps pointing at freed memory, and
+	 * every later add/del writes through it -- into whatever the slab has
+	 * since handed out (KFENCE: use-after-free writes in lru_gen_add_mm from
+	 * fork() and lru_gen_del_mm from mmput(), into names_cache, sigqueue and
+	 * mm_struct objects). That was the source of a whole family of host
+	 * crashes under many concurrent sandboxes: an i_readcount underflow in
+	 * __fput, a vfs_link that never returned, __destroy_inode on a tmpfs
+	 * umount, a NULL page in ext4_finish_bio.
+	 */
 
 	arg.handle = sp->handle;
 	if (copy_to_user(uarg, &arg, sizeof(arg))) {
 		mutex_lock(&ctx->lock);
 		idr_remove(&ctx->as_idr, id);
 		mutex_unlock(&ctx->lock);
-		kfree(sp);
 		mmput(mm);
+		call_rcu(&sp->rcu, jas_space_free_rcu);	/* it was findable */
 		return -EFAULT;
 	}
 	return 0;
 }
 
-/* Looks up an address space by handle, rejecting a stale generation. */
+/*
+ * A handle's record holds two things on its address space: a user reference
+ * (mm_users, mmget/mmput), which keeps the address space alive, and a
+ * structure reference (mm_count, mmgrab/mmdrop), which only keeps struct
+ * mm_struct's memory valid. Release drops the first at once and the second,
+ * with the record itself, a grace period later -- so that a SWITCH racing
+ * with the RELEASE of the same handle, which Junction does routinely (its
+ * arena collector and its memory-map destructor both "try" address spaces that
+ * another thread may be releasing), finds either a live address space or
+ * nothing, and never one that is being torn down.
+ *
+ * It used to find the third. SWITCH looked the mm up and took its reference
+ * afterwards, with nothing held in between; RELEASE meanwhile dropped the last
+ * reference, exit_mmap() closed every mapped file, and SWITCH then revived the
+ * corpse with mmget() and ran on it. Its own mmput() tore the address space
+ * down a second time: files released twice, "kernel BUG at fs.h:2906"
+ * (i_readcount underflow in __fput), panic. It took 128 sandboxes with four
+ * kthreads each, three hours in, to lose that race.
+ */
+/*
+ * The drop itself runs in process context, never in the RCU callback: that
+ * is softirq context, and when this is the last structure reference,
+ * __mmdrop() -> pgd_free() takes pgd_lock -- the spinlock pgd_alloc() holds
+ * with interrupts enabled on every fork(). A softirq landing on a CPU inside
+ * pgd_alloc() then deadlocks that CPU against itself and every forking CPU
+ * behind it ("softlockup: hung tasks", 128 sandboxes booting at once). The
+ * kernel's own mmdrop_async() exists for this reason and is not exported, so
+ * this is the same thing by hand.
+ */
+static void jas_space_free_work(struct work_struct *work)
+{
+	struct jas_space *sp = container_of(work, struct jas_space, work);
+
+	mmdrop(sp->mm);
+	kfree(sp);
+}
+
+static void jas_space_free_rcu(struct rcu_head *head)
+{
+	struct jas_space *sp = container_of(head, struct jas_space, rcu);
+
+	INIT_WORK(&sp->work, jas_space_free_work);
+	queue_work(jas_wq, &sp->work);
+}
+
+/*
+ * Looks up an address space by handle, rejecting a stale generation, and
+ * returns it with a user reference held -- or NULL if it is gone or going.
+ */
 static struct mm_struct *jas_lookup(struct jas_ctx *ctx, unsigned long handle)
 {
 	struct jas_space *sp;
 
+	struct mm_struct *mm = NULL;
+
 	rcu_read_lock();
 	sp = idr_find(&ctx->as_idr, JAS_HANDLE_ID(handle));
+	if (sp && sp->handle == (u64)handle && mmget_not_zero(sp->mm))
+		mm = sp->mm;
 	rcu_read_unlock();
-	if (!sp || sp->handle != (u64)handle)
-		return NULL;
-	return sp->mm;
+	return mm;
 }
 
 static long jas_switch(struct jas_ctx *ctx, unsigned long handle)
@@ -517,7 +593,8 @@ static long jas_switch(struct jas_ctx *ctx, unsigned long handle)
 	struct mm_struct *mm;
 
 	if (handle == 0) {
-		mm = ctx->root_mm;
+		mm = ctx->root_mm;	/* held by the context for its lifetime */
+		mmget(mm);
 	} else {
 		mm = jas_lookup(ctx, handle);
 		if (!mm)
@@ -571,7 +648,6 @@ static long jas_release(struct jas_ctx *ctx, unsigned long handle)
 	if (!sp)
 		return -ENOENT;
 	mm = sp->mm;
-	kfree(sp);
 
 	/*
 	 * Detach from the shared tables before this address space can be torn
@@ -584,9 +660,12 @@ static long jas_release(struct jas_ctx *ctx, unsigned long handle)
 	/*
 	 * Threads still bound to this mm hold their own references, so the
 	 * address space survives until the last of them switches away or
-	 * exits. Junction is expected to have switched them away already.
+	 * exits -- in practice an idle runtime kthread, which keeps the last
+	 * address space it ran until it schedules a thread of another; that is
+	 * routine, and harmless without page-table sharing.
 	 */
 	mmput(mm);
+	call_rcu(&sp->rcu, jas_space_free_rcu);
 	return 0;
 }
 
@@ -648,7 +727,7 @@ static int jas_release_file(struct inode *ino, struct file *f)
 	idr_for_each_entry(&ctx->as_idr, sp, id) {
 		jas_unshare_from(ctx, sp->mm);
 		mmput(sp->mm);
-		kfree(sp);
+		call_rcu(&sp->rcu, jas_space_free_rcu);
 	}
 	idr_destroy(&ctx->as_idr);
 
@@ -681,9 +760,13 @@ static int __init jas_init(void)
 	if (ret)
 		return ret;
 
+	jas_wq = alloc_workqueue("junction_as", 0, 0);
+	if (!jas_wq)
+		return -ENOMEM;
 	ret = misc_register(&jas_dev);
 	if (ret) {
 		pr_err("failed to register /dev/junction_as: %d\n", ret);
+		destroy_workqueue(jas_wq);
 		return ret;
 	}
 
@@ -694,6 +777,8 @@ static int __init jas_init(void)
 static void __exit jas_exit(void)
 {
 	misc_deregister(&jas_dev);
+	rcu_barrier();	/* jas_space_free_rcu() lives in this module ... */
+	destroy_workqueue(jas_wq);	/* ... and flushes into this workqueue */
 	pr_info("unloaded\n");
 }
 

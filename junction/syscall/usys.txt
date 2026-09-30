@@ -38,6 +38,7 @@ pwritev2
 pread64
 preadv
 sendfile
+splice
 lseek
 fsync
 fdatasync
@@ -49,6 +50,7 @@ brk
 mmap
 mprotect
 munmap
+mremap
 madvise
 newfstatat
 statfs
@@ -66,11 +68,13 @@ link
 linkat
 unlink
 unlinkat
-chown:::stub
-fchownat:::stub
+chown
+fchownat
 chmod
 fchmod
 fchmodat
+fchown
+lchown
 fchmodat2
 getcwd
 umask
@@ -206,3 +210,12 @@ mlockall:::stub
 munlockall:::stub
 setpriority:::stub
 getpriority:::stub
+ptrace
+timer_create
+timer_settime
+timer_gettime
+timer_getoverrun
+timer_delete
+chroot
+setreuid
+setregid

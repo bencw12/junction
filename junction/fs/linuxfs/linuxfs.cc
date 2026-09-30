@@ -28,14 +28,20 @@ Status<std::shared_ptr<File>> LinuxInode::Open(
 
 [[nodiscard]] off_t LinuxInode::get_size() const {
   if constexpr (!linux_fs_writeable()) return size_;
+  // By path, so it can fail for a file that is perfectly alive: one unlinked
+  // or renamed over while something still holds it open, which git does to
+  // its index and objects all day. That is not corruption, and must not end
+  // the container; the last size seen is the best answer there is.
   Status<struct stat> stat = linux_root_fd.StatAt(path_);
-  if (unlikely(!stat)) LinuxFSPanic("bad stat", stat.error());
+  if (unlikely(!stat)) return size_;
+  size_ = stat->st_size;
   return stat->st_size;
 }
 
 Status<void> LinuxInode::SetSize(size_t size) {
   if constexpr (!linux_fs_writeable()) return MakeError(EACCES);
-  long ret = ksyscall(__NR_truncate, path_.data(), size);
+  long ret = KernelRetryEintr(
+      [&] { return ksyscall(__NR_truncate, KernelPath(path_), size); });
   if (ret < 0) return MakeError(-ret);
   return {};
 }

@@ -29,6 +29,13 @@ int DoPoll(pollfd *fds, nfds_t nfds, std::optional<Duration> timeout,
   // Check each file; if at least one has events, no need to block.
   FileTable &ftbl = myproc().get_file_table();
   for (nfds_t i = 0; i < nfds; i++) {
+    // A negative fd marks a slot to skip: no events, and not an error. Arrays
+    // with unused slots are common -- ssh-keyscan polls 256 entries, one in
+    // use, and took "255 ready" to mean its connection had failed.
+    if (fds[i].fd < 0) {
+      fds[i].revents = 0;
+      continue;
+    }
     File *f = ftbl.Get(fds[i].fd);
     if (unlikely(!f)) {
       fds[i].revents = static_cast<short>(kPollInval);
@@ -83,6 +90,7 @@ int DoPoll(pollfd *fds, nfds_t nfds, std::optional<Duration> timeout,
         if (args.nevents > 0) args.waker.Wake();
       }
     });
+    if (fds[i].fd < 0) continue;  // skipped slot: its trigger stays detached
     File *f = ftbl.Get(fds[i].fd);
     assert(f != nullptr);
     PollSource &src = f->get_poll_source();
@@ -106,6 +114,7 @@ int DoPoll(pollfd *fds, nfds_t nfds, std::optional<Duration> timeout,
     if (likely(nevents > 0 || timed_out || signaled)) break;
 
     for (nfds_t i = 0; i < nfds; i++) {
+      if (fds[i].fd < 0) continue;
       File *f = ftbl.Get(fds[i].fd);
       assert(f != nullptr);
       PollSource &src = f->get_poll_source();
@@ -150,15 +159,12 @@ std::vector<select_fd> DecodeSelectFDs(int nfds, fd_set *readfds,
 
     if (readfds && FD_ISSET(i, readfds)) {
       events |= kSelectIn;
-      FD_CLR(i, readfds);
     }
     if (writefds && FD_ISSET(i, writefds)) {
       events |= kSelectOut;
-      FD_CLR(i, writefds);
     }
     if (exceptfds && FD_ISSET(i, exceptfds)) {
       events |= kSelectExcept;
-      FD_CLR(i, exceptfds);
     }
 
     if (!events) continue;
@@ -168,9 +174,21 @@ std::vector<select_fd> DecodeSelectFDs(int nfds, fd_set *readfds,
   return sfds;
 }
 
+// The sets are rewritten here and only here -- on success. On an error they
+// have to come back as they went in: kwsys (cmake's process runner) waits with
+// "while (select(n, &set, ...) < 0 && errno == EINTR) {}", never rebuilding
+// the set, and every SIGCHLD used to leave it waiting on nothing, forever.
 int EncodeSelectFDs(const std::vector<select_fd> &sfds, fd_set *readfds,
                     fd_set *writefds, fd_set *exceptfds) {
   int count = 0;
+
+  for (const auto &sfd : sfds) {
+    // (These masks overlap; a full match is what says the set was given.)
+    if ((sfd.events & kSelectIn) == kSelectIn) FD_CLR(sfd.fd, readfds);
+    if ((sfd.events & kSelectOut) == kSelectOut) FD_CLR(sfd.fd, writefds);
+    if ((sfd.events & kSelectExcept) == kSelectExcept)
+      FD_CLR(sfd.fd, exceptfds);
+  }
 
   for (const auto &sfd : sfds) {
     if ((sfd.events & kSelectIn) == kSelectIn &&
@@ -224,7 +242,10 @@ std::pair<int, Duration> DoSelect(
     Duration d = timeout.value_or(Duration(0));
     return std::make_pair(ret, d);
   }
-  if (timeout && timeout->IsZero()) return std::make_pair(0, Duration(0));
+  if (timeout && timeout->IsZero()) {
+    EncodeSelectFDs(sfds, readfds, writefds, exceptfds);  // nothing is ready
+    return std::make_pair(0, Duration(0));
+  }
 
   // Otherwise, init state to block on the FDs and timeout.
   rt::Spin lock;

@@ -453,6 +453,24 @@ class ProcessDir : public ProcFSDir {
     Credential &creds = (*thread)->get_creds();
     rt::RuntimeLibcGuard g;
     std::ostringstream ss;
+    // The identity lines first, as the kernel has them; ps, pgrep and psutil
+    // read them from here rather than from stat.
+    std::string nm = p->get_mem_map().get_bin_name();
+    if (nm.size() > 15) nm.resize(15);
+    const char *state = p->exited() ? "Z (zombie)"
+                        : p->is_stopped() ? "T (stopped)"
+                                          : "R (running)";
+    ss << "Name:\t" << nm << "\n"
+       << "State:\t" << state << "\n"
+       << "Tgid:\t" << p->get_pid() << "\n"
+       << "Pid:\t" << p->get_pid() << "\n"
+       << "PPid:\t" << p->get_ppid() << "\n"
+       << "TracerPid:\t0\n"
+       << "Uid:\t" << creds.ruid << "\t" << creds.euid << "\t" << creds.suid
+       << "\t" << creds.euid << "\n"
+       << "Gid:\t" << creds.rgid << "\t" << creds.egid << "\t" << creds.sgid
+       << "\t" << creds.egid << "\n"
+       << "Threads:\t" << p->thread_count() << "\n";
     ss << "CapInh: " << std::setfill('0') << std::setw(16) << std::hex
        << creds.inheritable << std::endl;
     ss << "CapPrm: " << std::setfill('0') << std::setw(16) << creds.permitted
@@ -492,16 +510,19 @@ class ProcessDir : public ProcFSDir {
     ss << " 0";                  // tty_nr
     ss << " " << p->get_pgid();  // tpgid;
     ss << " 0 0 0 0 0";          // flags, minflt, cminflt, majflt, cmajflt
-    ss << " utime";
-    ss << " stime";
-    ss << " cutime";
-    ss << " cstime";
+    // utime, stime, cutime, cstime. Numbers, whatever they are: these were the
+    // words "utime stime ...", and with vsize and rss empty below the line had
+    // the wrong number of fields too. procps gives up on such a line and takes
+    // the pid to be 0 -- so `pkill -f pattern` could not tell itself from its
+    // targets, matched itself, and sent its signal to pid 0: its own process
+    // group, the shell that ran it included.
+    ss << " 0 0 0 0";
     ss << " 0 0";  // priority, nice
     ss << " " << p->thread_count();
     ss << " 0";  // itrealvalue, always zero.
     ss << " " << microtime() / 10000;
-    ss << " ";  // vsize - Virtual memory size in bytes.
-    ss << " ";  // rss
+    ss << " 0";  // vsize - Virtual memory size in bytes.
+    ss << " 0";  // rss
     ss << " " << p->get_limits().GetLimit(RLIMIT_RSS)->rlim_cur;
 
     // startcode, endcode, startstack, kstkesp, kstkeip

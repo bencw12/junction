@@ -8,6 +8,7 @@
 #include "junction/base/arch.h"
 #include "junction/fs/file.h"
 #include "junction/fs/fs.h"
+#include "junction/fs/pty.h"
 #include "junction/fs/stdiofile.h"
 
 namespace junction {
@@ -125,6 +126,9 @@ Status<std::shared_ptr<File>> DeviceOpen(std::shared_ptr<DirectoryEntry> dent,
   // Only character devices supported so far.
   if (dent->get_inode_ref().get_type() != kTypeCharacter)
     return MakeError(ENODEV);
+
+  // Terminals are not in the table: /dev/pts/N is a device number per pty.
+  if (IsPtyDevice(dev)) return PtyOpen(std::move(dent), dev, flags, mode);
 
   // Check if we support this type of device.
   auto it = CharacterDevices.find(dev);

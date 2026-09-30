@@ -155,7 +155,8 @@ long usys_setsockopt(int sockfd, int level, int option_name,
       std::span<const std::byte>(
           reinterpret_cast<const std::byte *>(option_value), option_len));
   if (!val) {
-    LOG_ONCE(WARN) << "Unsupported: setsockopt";
+    LOG(WARN) << "Unsupported: setsockopt level " << level << " option "
+              << option_name;
     return MakeCError(val);
   }
   return 0;
@@ -176,7 +177,8 @@ long usys_getsockopt(int sockfd, int level, int option_name, void *option_value,
       std::span<std::byte>(reinterpret_cast<std::byte *>(option_value),
                            option_len ? *option_len : 0));
   if (!val) {
-    LOG_ONCE(WARN) << "Unsupported: getsockopt";
+    LOG(WARN) << "Unsupported: getsockopt level " << level << " option "
+              << option_name;
     return MakeCError(val);
   }
   *option_len = *val;

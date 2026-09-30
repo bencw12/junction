@@ -243,6 +243,18 @@ usys_rt_sigreturn_end:
 	test    %cl, %cl
 	jg      1f
 
+	// A restart code must never reach the guest, whatever the interrupt state
+	// says by now. An interruptible wait returns one when it is broken; if the
+	// signal that broke it has since been discarded -- it was ignored -- the
+	// flag is clear again, and the raw -ERESTARTNOHAND went out as the result
+	// of the system call (apt's http method: pselect6() = -514, exit 100).
+	// RunSignals restarts the call when there turns out to be no handler.
+	// %rdi is the return value here, and zero on later passes.
+	cmpq    $-514, %rdi
+	je      1f
+	cmpq    $-512, %rdi
+	je      1f
+
 	\final_unwind
 
 1:

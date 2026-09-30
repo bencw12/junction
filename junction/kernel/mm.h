@@ -190,6 +190,16 @@ class alignas(kCacheLineSize) MemoryMap {
     if (as_ref_) as_ref_->holders.fetch_add(1, std::memory_order_acq_rel);
   }
 
+  // Makes this map the first holder of a newly created address space, as
+  // Fork() does for a child's. exec() uses it when it has to move a process
+  // out of an address space it shares.
+  void OwnAddressSpace(uint64_t handle);
+
+  // Unmaps this map's mappings in the calling kthread's current address space
+  // only, without touching the map's bookkeeping. For an address space that
+  // inherited a copy of them -- a clone made for an exec -- and keeps none.
+  void UnmapInheritedCopyHere();
+
   // The range reserved for this memory map.
   [[nodiscard]] AddressRange get_reservation() const {
     return {mm_start_, mm_end_};
@@ -294,7 +304,27 @@ class alignas(kCacheLineSize) MemoryMap {
     assert(!is_non_reloc_);
     is_non_reloc_ = true;
     nr_non_reloc_maps_++;
+    (void)ClaimFixedImageSlot();  // whoever got here without asking first
   };
+
+  // An address space has room for one non-relocatable image: they all want the
+  // same addresses. The map that holds it owns the address space's slot, from
+  // before it loads the image until after its destructor has unmapped it --
+  // not "while a process with such a map is on the process list", which is how
+  // this used to be decided. That missed a map whose process has exited but
+  // which has not been destroyed yet: the next image loaded over its mappings,
+  // and its destructor then unmapped them from under the new program ("mm:
+  // exec fault at 0x43b000 keeps recurring; the text is not mapped", a compiler
+  // dying of SIGSEGV in the middle of make). And it was check-then-act: two
+  // vfork children exec'ing at once in their parent's address space both saw
+  // it free. make -j does both.
+  //
+  // Returns false if another map holds the slot of this map's address space.
+  [[nodiscard]] bool ClaimFixedImageSlot();
+  void ReleaseFixedImageSlot();
+  // exec in place: the old map's image is unmapped and the new one's loaded at
+  // the same addresses, in the same address space.
+  static void TransferFixedImageSlot(MemoryMap &from, MemoryMap &to);
 
   void set_bin_path(std::shared_ptr<DirectoryEntry> binary_path,
                     const std::vector<std::string_view> &argv) {
@@ -419,6 +449,12 @@ class alignas(kCacheLineSize) MemoryMap {
   std::shared_ptr<DirectoryEntry> binary_path_;
   std::string cmd_line_;
   bool is_non_reloc_{false};
+  bool holds_fixed_slot_{false};
+  uint64_t fixed_slot_handle_{0};
+  // Consecutive "spurious" exec faults on one page; see HandlePageFault.
+  static constexpr unsigned kMaxExecFaultRepeats = 64;
+  uintptr_t last_exec_fault_{0};
+  unsigned exec_fault_repeats_{0};
   bool is_fake_map_{false};  // old ELF snapshot code uses this.
   // The address space these mappings live in. Guest processes that have never
   // forked share the address space Junction started in.

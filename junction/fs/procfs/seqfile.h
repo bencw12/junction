@@ -23,8 +23,33 @@ class SeqFile : public File {
     return to_read;
   }
 
+  // procps rewinds /proc/meminfo before each read (even the first) and gives
+  // up -- "Unable to get total memory" -- if it cannot. The contents are the
+  // ones generated at open(); a rewind reads them again.
+  Status<off_t> Seek(off_t off, SeekFrom origin) override {
+    off_t pos;
+    switch (origin) {
+      case SeekFrom::kStart:
+        pos = off;
+        break;
+      case SeekFrom::kCurrent:
+        pos = get_off_ref() + off;
+        break;
+      case SeekFrom::kEnd:
+        pos = static_cast<off_t>(output_.size()) + off;
+        break;
+      default:
+        return MakeError(EINVAL);
+    }
+    if (pos < 0) return MakeError(EINVAL);
+    return pos;
+  }
+
  private:
   friend cereal::access;
+
+  // Always ready, as any regular file is.
+  void SetupPollSource() override { get_poll_source().Set(POLLIN | POLLOUT); }
 
   template <class Archive>
   void save(Archive &ar) const {

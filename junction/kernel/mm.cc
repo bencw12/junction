@@ -25,6 +25,8 @@ extern "C" {
 #include "junction/kernel/arena.h"
 #include "junction/kernel/as.h"
 #include "junction/kernel/mm.h"
+
+#include <map>
 #include "junction/kernel/proc.h"
 #include "junction/kernel/usys.h"
 
@@ -47,6 +49,41 @@ ExclusiveIntervalSet<SimpleInterval> MemoryMap::mem_areas_;
 ExclusiveIntervalSet<SimpleInterval> MemoryMap::libos_areas_;
 
 std::atomic_size_t MemoryMap::nr_non_reloc_maps_{0};
+
+namespace {
+rt::Spin fixed_slot_lock;
+std::map<uint64_t, const MemoryMap *> fixed_slot_owner;
+}  // namespace
+
+bool MemoryMap::ClaimFixedImageSlot() {
+  rt::SpinGuard g(fixed_slot_lock);
+  if (holds_fixed_slot_ && fixed_slot_handle_ == as_handle_) return true;
+  auto [it, fresh] = fixed_slot_owner.try_emplace(as_handle_, this);
+  if (!fresh && it->second != this) return false;
+  holds_fixed_slot_ = true;
+  fixed_slot_handle_ = as_handle_;
+  return true;
+}
+
+void MemoryMap::ReleaseFixedImageSlot() {
+  rt::SpinGuard g(fixed_slot_lock);
+  if (!holds_fixed_slot_) return;
+  auto it = fixed_slot_owner.find(fixed_slot_handle_);
+  if (it != fixed_slot_owner.end() && it->second == this)
+    fixed_slot_owner.erase(it);
+  holds_fixed_slot_ = false;
+}
+
+void MemoryMap::TransferFixedImageSlot(MemoryMap &from, MemoryMap &to) {
+  rt::SpinGuard g(fixed_slot_lock);
+  if (!from.holds_fixed_slot_) return;
+  auto it = fixed_slot_owner.find(from.fixed_slot_handle_);
+  if (it == fixed_slot_owner.end() || it->second != &from) return;
+  it->second = &to;
+  to.holds_fixed_slot_ = true;
+  to.fixed_slot_handle_ = from.fixed_slot_handle_;
+  from.holds_fixed_slot_ = false;
+}
 
 namespace {
 
@@ -221,6 +258,8 @@ std::shared_ptr<MemoryMap> MemoryMap::Fork(MemoryMap &parent,
   mm->cmd_line_ = parent.cmd_line_;
   mm->is_non_reloc_ = parent.is_non_reloc_;
   if (mm->is_non_reloc_) nr_non_reloc_maps_++;
+  // Its copy of the image is the one in the new address space.
+  if (mm->is_non_reloc_) (void)mm->ClaimFixedImageSlot();
   // The child's mappings are the parent's, at the same addresses, in an
   // address space Linux populated with copy-on-write copies of them.
   for (auto const &[end, vma] : parent.vmareas_) {
@@ -232,6 +271,32 @@ std::shared_ptr<MemoryMap> MemoryMap::Fork(MemoryMap &parent,
     AcquireRegionRef(parent.mm_start_);
   }
   return mm;
+}
+
+void MemoryMap::OwnAddressSpace(uint64_t handle) {
+  as_handle_ = handle;
+  arena_gc_cursor_ = ArenaGcSlot(handle, 0);
+  as_ref_ = std::make_shared<AddressSpaceRef>();
+  as_ref_->handle = handle;
+  as_ref_->holders.store(1, std::memory_order_relaxed);
+}
+
+void MemoryMap::UnmapInheritedCopyHere() {
+  rt::ScopedSharedLock g(mu_);
+  // Whatever lies outside the reservation: a non-relocatable image.
+  for (auto const &[end, vma] : vmareas_) {
+    if (vma.start >= mm_start_ && vma.end <= mm_end_) continue;
+    Status<void> ret = KernelMUnmap(vma.Addr(), vma.Length());
+    if (!ret) LOG(WARN) << "mm: could not drop inherited copy " << ret.error();
+  }
+  // And the reservation whole, not just the mappings in it. The PROT_NONE
+  // that fills the gaps was cloned too, and left behind it is inherited by
+  // every fork from here on -- until the region is handed to someone else and
+  // their MAP_FIXED_NOREPLACE finds it occupied ("mm: Create wanted ... got
+  // 0", in an address space that never had anything to do with that region).
+  Status<void> ret =
+      KernelMUnmap(reinterpret_cast<void *>(mm_start_), mm_end_ - mm_start_);
+  if (!ret) LOG(WARN) << "mm: could not drop inherited region " << ret.error();
 }
 
 Status<std::shared_ptr<MemoryMap>> MemoryMap::Create(size_t len) {
@@ -256,6 +321,15 @@ Status<std::shared_ptr<MemoryMap>> MemoryMap::Create(size_t len) {
     AcquireRegionRef(*base);
   }
   auto mm = std::make_shared<MemoryMap>(*ret, len);
+  // The reservation above went into the address space this core is bound to,
+  // and that is where this map lives until exec says otherwise. It has to be
+  // recorded now, not once the exec has succeeded: a map abandoned because the
+  // exec failed -- ENOEXEC is routine, shells try and fall back -- is destroyed
+  // with whatever handle it has, and with the default (the root's) its
+  // destructor unmapped the reservation from the root address space and left
+  // it behind in the caller's, for the next process given this region to
+  // collide with ("mm: Create wanted ... got 0", in a forked guest).
+  mm->as_handle_ = GetActiveAddressSpace();
   mm->arena_gc_cursor_ = ArenaGcSlot(mm->as_handle_, 0);
   return mm;
 }
@@ -294,9 +368,17 @@ MemoryMap::~MemoryMap() {
   // live address space, not a dead one's still-loaded mappings.
   if (as_ref_ &&
       as_ref_->holders.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+    // Binding and the per-core record of it change together, or not at all: a
+    // migration between the ioctl and the store leaves some other core
+    // recording the root space while bound elsewhere, and the next thread
+    // there that wants the root skips the switch and runs where its memory
+    // does not exist ("fault ... as=0 ... kernel_as=<other>").
+    rt::Preempt::Lock();
     if (GetActiveAddressSpace() == as_handle_)
       ActivateAddressSpace(kRootAddressSpace);
+    rt::Preempt::Unlock();
     ReleaseAddressSpace(as_handle_);
+    ReleaseFixedImageSlot();
     MemoryMap::FreeMMRegion(mm_start_, mm_end_);
     return;
   }
@@ -319,7 +401,20 @@ MemoryMap::~MemoryMap() {
   // may be long after the new image has exited and released the space. If it
   // is already gone then so are these mappings -- Linux tore them down with
   // it -- and only the reservation is left to release.
+  //
+  // This is a visit, and has to end as one. The destructor runs on whichever
+  // thread drops the last reference -- a parent reaping a child, say, living
+  // in a different address space from these mappings. Left bound to ours, it
+  // goes on executing where its own text and data do not exist: an exec fault
+  // that never resolves, then a segfault in its next system call ("as=0
+  // want_as=N"). And preemption stays off for the duration: a reschedule in
+  // the middle has on_sched() rebind the core to the running thread's space,
+  // and the rest of these munmaps would land on live memory there.
+  rt::Preempt::Lock();
+  const uint64_t resume = GetActiveAddressSpace();
   if (!TryActivateAddressSpace(as_handle_)) {
+    rt::Preempt::Unlock();
+    ReleaseFixedImageSlot();
     MemoryMap::FreeMMRegion(mm_start_, mm_end_);
     return;
   }
@@ -333,6 +428,12 @@ MemoryMap::~MemoryMap() {
   Status<void> ret =
       KernelMUnmap(reinterpret_cast<void *>(mm_start_), mm_end_ - mm_start_);
   if (!ret) LOG(ERR) << "mm: munmap failed with error " << ret.error();
+
+  if (resume != as_handle_ && !TryActivateAddressSpace(resume))
+    ActivateAddressSpace(kRootAddressSpace);
+  rt::Preempt::Unlock();
+  // Only now, with the image unmapped, may another one be loaded here.
+  ReleaseFixedImageSlot();
   MemoryMap::FreeMMRegion(mm_start_, mm_end_);
 }
 
@@ -523,6 +624,21 @@ bool MemoryMap::HandlePageFault(uintptr_t addr, int required_prot, Time time) {
   // Exec fault
   if (!tracer_ && vma.prot == (PROT_READ | PROT_EXEC) &&
       required_prot == PROT_EXEC) {
+    // Nothing is repaired here: the fault is declared spurious and the
+    // instruction retried. If the text really is missing that never ends --
+    // one guest instruction refaulting forever on a core. Let a page be
+    // retried a few times, then let the process take its SIGSEGV.
+    if (addr == last_exec_fault_) {
+      if (++exec_fault_repeats_ > kMaxExecFaultRepeats) {
+        LOG(ERR) << "mm: exec fault at " << (void *)addr
+                 << " keeps recurring; the text is not mapped in as="
+                 << GetActiveAddressSpace() << " (want " << as_handle_ << ")";
+        return false;
+      }
+    } else {
+      last_exec_fault_ = addr;
+      exec_fault_repeats_ = 0;
+    }
     return true;
   }
 
@@ -976,6 +1092,62 @@ intptr_t usys_mmap(void *addr, size_t len, int prot, int flags, int fd,
   });
   if (!ret) return MakeCErrorRestartSys(ret);
   return reinterpret_cast<intptr_t>(*ret);
+}
+
+// mremap for guest memory. Shrinking unmaps the tail in place. Growing always
+// moves: a new anonymous mapping, a copy, and an unmap of the old range, which
+// is what MREMAP_MAYMOVE permits and needs nothing from the address-space
+// machinery beyond mmap and munmap. Only anonymous memory can grow -- a file
+// mapping cannot be rebuilt by copying, and neither could a MAP_SHARED one,
+// which the VMA does not distinguish; glibc's realloc and apt's cache, the
+// callers that matter, only ever grow private memory. Everything else gets
+// ENOMEM, which callers treat as "allocate and copy yourself" -- unlike the
+// ENOSYS this used to return, which apt treats as fatal.
+long usys_mremap(void *old_addr, size_t old_len, size_t new_len, int flags,
+                 [[maybe_unused]] void *new_addr) {
+  if (unlikely(flags & ~MREMAP_MAYMOVE)) return -EINVAL;
+  if (unlikely(!IsPageAligned(reinterpret_cast<uintptr_t>(old_addr)) ||
+               !old_len || !new_len))
+    return -EINVAL;
+  old_len = PageAlign(old_len);
+  new_len = PageAlign(new_len);
+  if (new_len == old_len) return reinterpret_cast<intptr_t>(old_addr);
+
+  MemoryMap &mm = myproc().get_mem_map();
+  auto *old_p = static_cast<std::byte *>(old_addr);
+
+  if (new_len < old_len) {
+    Status<void> ret = TracerGuardCheck(
+        mm, [&] { return mm.MUnmap(old_p + new_len, old_len - new_len); });
+    if (!ret) return MakeCErrorRestartSys(ret);
+    return reinterpret_cast<intptr_t>(old_addr);
+  }
+
+  // The old range must lie within one readable anonymous mapping.
+  const uintptr_t start = reinterpret_cast<uintptr_t>(old_addr);
+  int prot = -1;
+  mm.ForEachVMA([&](const VMArea &vma) {
+    if (vma.start <= start && start + old_len <= vma.end &&
+        vma.type != VMType::kFile)
+      prot = vma.prot;
+  });
+  if (prot == -1) return -EFAULT;
+  if (!(flags & MREMAP_MAYMOVE) || !(prot & PROT_READ)) return -ENOMEM;
+
+  Status<void *> dst = TracerGuardCheck(mm, [&] {
+    return mm.MMapAnonymous(nullptr, new_len, PROT_READ | PROT_WRITE, 0);
+  });
+  if (!dst) return MakeCErrorRestartSys(dst);
+  std::memcpy(*dst, old_addr, old_len);
+  if (prot != (PROT_READ | PROT_WRITE)) {
+    Status<void> ret =
+        TracerGuardCheck(mm, [&] { return mm.MProtect(*dst, new_len, prot); });
+    if (!ret) return MakeCErrorRestartSys(ret);
+  }
+  Status<void> ret =
+      TracerGuardCheck(mm, [&] { return mm.MUnmap(old_addr, old_len); });
+  if (!ret) return MakeCErrorRestartSys(ret);
+  return reinterpret_cast<intptr_t>(*dst);
 }
 
 long usys_mprotect(void *addr, size_t len, int prot) {

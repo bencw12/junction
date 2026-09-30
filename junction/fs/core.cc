@@ -12,6 +12,8 @@ extern "C" {
 #include "junction/fs/dev.h"
 #include "junction/fs/file.h"
 #include "junction/fs/fs.h"
+#include "junction/fs/fsstat.h"
+#include "junction/fs/pty.h"
 #include "junction/fs/procfs/procfs.h"
 #include "junction/fs/stdiofile.h"
 #include "junction/kernel/proc.h"
@@ -19,6 +21,14 @@ extern "C" {
 #include "junction/snapshot/snapshot.h"
 
 namespace junction {
+
+int64_t Inode::RealtimeNs() {
+  // The clock gettimeofday() is served from, so a file's mtime and the time
+  // a program reads agree.
+  struct timeval tv = Time::Now().TimevalUnixTime();
+  return static_cast<int64_t>(tv.tv_sec) * 1000000000 +
+         static_cast<int64_t>(tv.tv_usec) * 1000;
+}
 
 FSRoot *FSRoot::global_root_ = nullptr;
 
@@ -280,6 +290,7 @@ Status<std::shared_ptr<File>> Open(const FSRoot &fs, const Entry &path,
                                   std::move(*in));
 
   if (truncate) ino->SetSize(0);
+  FsStatNoteOpen(*ino);
   return (*in)->Open(flags, fmode);
 }
 
@@ -655,6 +666,18 @@ long usys_chdir(const char *pathname) {
   return 0;
 }
 
+// sshd confines its unprivileged pre-authentication child to an empty
+// directory this way, and treats failure as fatal: every login died with it.
+long usys_chroot(const char *pathname) {
+  Process &p = myproc();
+  Status<std::shared_ptr<DirectoryEntry>> dent =
+      LookupDirEntry(p.get_fs(), pathname);
+  if (!dent) return MakeCError(dent);
+  if (!(*dent)->get_inode()->is_dir()) return -ENOTDIR;
+  p.SetRoot(std::move(*dent));
+  return 0;
+}
+
 long usys_fchdir(int fd) {
   Process &p = myproc();
   Status<std::shared_ptr<Inode>> ino = GetFileInode(fd, p);
@@ -744,14 +767,14 @@ long usys_chmod(const char *path, mode_t mode) {
   FSRoot &fs = myproc().get_fs();
   Status<std::shared_ptr<Inode>> ino = LookupInode(fs, path, false);
   if (!ino) return MakeCError(ino);
-  (*ino)->SetMode(mode);
+  if (Status<void> ret = (*ino)->ChangeMode(mode); !ret) return MakeCError(ret);
   return 0;
 }
 
 long usys_fchmod(int fd, mode_t mode) {
   Status<std::shared_ptr<Inode>> ino = GetFileInode(fd, myproc());
   if (!ino) return MakeCError(ino);
-  (*ino)->SetMode(mode);
+  if (Status<void> ret = (*ino)->ChangeMode(mode); !ret) return MakeCError(ret);
   return 0;
 }
 
@@ -759,7 +782,46 @@ long usys_fchmodat(int dirfd, const char *path, mode_t mode,
                    [[maybe_unused]] int flags) {
   Status<std::shared_ptr<Inode>> ino = LookupInode(myproc(), dirfd, path);
   if (!ino) return MakeCError(ino);
-  (*ino)->SetMode(mode);
+  if (Status<void> ret = (*ino)->ChangeMode(mode); !ret) return MakeCError(ret);
+  return 0;
+}
+
+// Ownership is recorded and reported (Inode::ChangeOwner) but not enforced.
+// apt and dpkg chown their download and status files and treat failure as
+// fatal; git and sshd read ownership back and refuse what is not theirs.
+long usys_chown(const char *path, uid_t owner, gid_t group) {
+  Status<std::shared_ptr<Inode>> ino = LookupInode(myproc().get_fs(), path, true);
+  if (!ino) return MakeCError(ino);
+  if (Status<void> ret = (*ino)->ChangeOwner(owner, group); !ret)
+    return MakeCError(ret);
+  return 0;
+}
+
+long usys_lchown(const char *path, uid_t owner, gid_t group) {
+  Status<std::shared_ptr<Inode>> ino =
+      LookupInode(myproc().get_fs(), path, false);
+  if (!ino) return MakeCError(ino);
+  if (Status<void> ret = (*ino)->ChangeOwner(owner, group); !ret)
+    return MakeCError(ret);
+  return 0;
+}
+
+long usys_fchown(int fd, uid_t owner, gid_t group) {
+  Status<std::shared_ptr<Inode>> ino = GetFileInode(fd, myproc());
+  if (!ino) return MakeCError(ino);
+  if (Status<void> ret = (*ino)->ChangeOwner(owner, group); !ret)
+    return MakeCError(ret);
+  return 0;
+}
+
+long usys_fchownat(int dirfd, const char *path, uid_t owner, gid_t group,
+                   int flags) {
+  if ((flags & AT_EMPTY_PATH) && path && !*path)
+    return usys_fchown(dirfd, owner, group);
+  Status<std::shared_ptr<Inode>> ino = LookupInode(myproc(), dirfd, path);
+  if (!ino) return MakeCError(ino);
+  if (Status<void> ret = (*ino)->ChangeOwner(owner, group); !ret)
+    return MakeCError(ret);
   return 0;
 }
 
@@ -855,6 +917,8 @@ Status<void> SetupDevices(std::shared_ptr<IDir> root) {
     return ret;
   if (Status<void> ret = memfs->MkNod("console", mode, MakeDevice(5, 1)); !ret)
     return ret;
+
+  if (Status<void> ret = SetupPtys(*memfs); !ret) return ret;
 
   Status<std::shared_ptr<DirectoryEntry>> ret = memfs->LookupDent("console");
   if (!ret) panic("just added it");

@@ -187,6 +187,26 @@ Status<void> LinuxWrIDir::SymLink(std::string_view name,
   return {};
 }
 
+// Every inode here caches its host path, so renaming a directory moves the
+// ground from under whatever has been looked up beneath it: the children kept
+// the old path and every later open of them failed with ENOENT. Walk the
+// cached subtree and rebuild the paths from the new one. (uv, pip and npm all
+// unpack into a temporary directory and rename it into place.)
+void LinuxWrIDir::RepathChildren() {
+  if (!is_initialized()) return;
+  ForEach([this](DirectoryEntry &dent) {
+    Inode *inode = &dent.get_inode_ref();
+    std::string child = AppendFileName(dent.get_name_locked());
+    if (inode->is_dir()) {
+      LinuxWrIDir *dir = fast_cast<LinuxWrIDir *>(inode);
+      dir->path_ = std::move(child);
+      dir->RepathChildren();
+    } else if (inode->is_regular()) {
+      fast_cast<LinuxInode *>(inode)->path_ = std::move(child);
+    }
+  });
+}
+
 Status<void> LinuxWrIDir::DoRename(LinuxWrIDir &src, std::string_view src_name,
                                    std::string_view dst_name, bool replace) {
   assert(lock_.IsHeld());
@@ -209,6 +229,7 @@ Status<void> LinuxWrIDir::DoRename(LinuxWrIDir &src, std::string_view src_name,
       if (inode->is_dir()) {
         LinuxWrIDir *dir = fast_cast<LinuxWrIDir *>(inode);
         dir->path_ = dst_path;
+        dir->RepathChildren();
       } else if (inode->is_regular()) {
         LinuxInode *file = fast_cast<LinuxInode *>(inode);
         file->path_ = dst_path;
@@ -266,6 +287,13 @@ Status<void> LinuxWrIDir::Link(std::string_view name,
   Status<void> ret = KernelFile::LinkAt(linux_root_fd, src_ino->get_path(),
                                         linux_root_fd, abspath);
   if (!ret) return ret;
+  // The inode is reached by one cached path, and a hard link is usually made
+  // so that the old name can go: git writes objects/xx/tmp_obj_N, links it to
+  // its final name and unlinks the temporary. Keep the name that survives --
+  // the newest -- or every later stat by path fails, and the size comes back
+  // as whatever it was when the file was created: zero. (git: "loose object
+  // ... is corrupt", for an object that is intact on disk.)
+  src_ino->path_ = abspath;
   if (is_initialized()) AddDentLockedNoCheck(std::string(name), std::move(ino));
   return {};
 }

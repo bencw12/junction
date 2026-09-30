@@ -17,7 +17,8 @@ static FutexTable f;
 
 FutexTable &FutexTable::GetFutexTable() { return f; }
 
-Status<void> FutexTable::Wait(uint32_t *key, uint32_t val, uint32_t bitset,
+Status<void> FutexTable::Wait(const void *mm, bool shared, uint32_t *key,
+                              uint32_t val, uint32_t bitset,
                               std::optional<Time> timeout) {
   // Hot path: Don't need to block for a false condition.
   if (read_once(*key) != val) return MakeError(EAGAIN);
@@ -27,7 +28,7 @@ Status<void> FutexTable::Wait(uint32_t *key, uint32_t val, uint32_t bitset,
   rt::ThreadWaker w;
   rt::WakeOnTimeout timed_out(bucket.lock, w, timeout);
   bool signaled;
-  detail::futex_waiter waiter{&w, key, bitset};
+  detail::futex_waiter waiter{&w, key, bitset, mm, shared};
 
   {
     rt::SpinGuard g(bucket.lock);
@@ -49,14 +50,15 @@ Status<void> FutexTable::Wait(uint32_t *key, uint32_t val, uint32_t bitset,
   return signaled ? MakeError(EINTR) : MakeError(ETIMEDOUT);
 }
 
-int FutexTable::Wake(uint32_t *key, int n, uint32_t bitset) {
+int FutexTable::Wake(const void *mm, bool shared, uint32_t *key, int n,
+                     uint32_t bitset) {
   if (unlikely(n == 0)) return 0;
   detail::futex_bucket &bucket = get_bucket(key);
   int i = 0;
   rt::SpinGuard g(bucket.lock);
   for (auto it = bucket.futexes.begin(); it != bucket.futexes.end();) {
     detail::futex_waiter &w = *it;
-    if (w.key != key || !(w.bitset & bitset)) {
+    if (!w.Matches(key, bitset, mm, shared)) {
       ++it;
       continue;
     }
@@ -84,6 +86,8 @@ constexpr bool FutexCmdHasTimeout(uint32_t cmd) {
 
 long usys_futex(uint32_t *uaddr, int futex_op, uint32_t val,
                 const struct timespec *ts, uint32_t *uaddr2, uint32_t val3) {
+  const bool shared = !(futex_op & FUTEX_PRIVATE_FLAG);
+  const void *mm = &myproc().get_mem_map();
   futex_op &= ~(FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME);
   FutexTable &t = FutexTable::GetFutexTable();
   std::optional<Time> timeout;
@@ -91,17 +95,17 @@ long usys_futex(uint32_t *uaddr, int futex_op, uint32_t val,
 
   switch (futex_op) {
     case FUTEX_WAKE:
-      return t.Wake(uaddr, val, kFutexBitsetAny);
+      return t.Wake(mm, shared, uaddr, val, kFutexBitsetAny);
     case FUTEX_WAKE_BITSET:
-      return t.Wake(uaddr, val, val3);
+      return t.Wake(mm, shared, uaddr, val, val3);
     case FUTEX_WAIT:
       if (ts) timeout = Time::Now() + Duration(*ts);
-      ret = t.Wait(uaddr, val, kFutexBitsetAny, timeout);
+      ret = t.Wait(mm, shared, uaddr, val, kFutexBitsetAny, timeout);
       if (!ret) return MakeCError(ret);
       break;
     case FUTEX_WAIT_BITSET:
       if (ts) timeout = Time::FromUnixTime(*ts);
-      ret = t.Wait(uaddr, val, val3, timeout);
+      ret = t.Wait(mm, shared, uaddr, val, val3, timeout);
       if (!ret) return MakeCError(ret);
       break;
     default:

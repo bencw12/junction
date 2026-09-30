@@ -58,6 +58,11 @@ class Inode : public std::enable_shared_from_this<Inode> {
 
   virtual ~Inode();
 
+  // Which backing store this inode lives in, for the fsstat counters.
+  [[nodiscard]] virtual int fs_kind() const { return 2; /* kFsOther */ }
+  // Counts an open() of this inode; returns the new count.
+  uint32_t note_open() { return open_count_.fetch_add(1, std::memory_order_relaxed) + 1; }
+
   // Open a file for this inode.
   virtual Status<std::shared_ptr<File>> Open(
       uint32_t flags, FileMode fmode, std::shared_ptr<DirectoryEntry> dent) = 0;
@@ -70,9 +75,44 @@ class Inode : public std::enable_shared_from_this<Inode> {
   // Sets the size of this inode.
   virtual Status<void> SetSize(size_t sz) { return MakeError(EINVAL); }
 
+  // Modification time, in nanoseconds since the epoch. Every inode used to
+  // report zero for all three timestamps. Things that decide what is fresh by
+  // mtime then decide nothing ever changed: Python's import system caches a
+  // directory's listing until its mtime moves, so a package installed into
+  // site-packages could not be imported; make and git's index are the same.
+  void TouchMtime() { mtime_ns_.store(RealtimeNs(), std::memory_order_relaxed); }
+  [[nodiscard]] int64_t get_mtime_ns() const {
+    return mtime_ns_.load(std::memory_order_relaxed);
+  }
+  static int64_t RealtimeNs();
+
   // Updates the mode on this inode (lower 12 bits only).
   void SetMode(mode_t new_mode) {
     mode_ = (mode_ & ~kModeMask) | (new_mode & kModeMask);
+  }
+
+  // chmod(): SetMode, plus whatever the backing store needs. An inode backed
+  // by a writable host file has to change the file too, or the mode is lost
+  // with this inode -- dpkg creates files with mode 0 and chmods them after.
+  virtual Status<void> ChangeMode(mode_t new_mode) {
+    SetMode(new_mode);
+    return {};
+  }
+
+  // chown(): an id of -1 leaves that one alone. Access is not checked against
+  // ownership anywhere, but programs read it back: git refuses a repository
+  // whose directory is not owned by the user running it ("dubious ownership"),
+  // sshd refuses an authorized_keys file owned by someone else.
+  virtual Status<void> ChangeOwner(uid_t uid, gid_t gid) {
+    if (uid != static_cast<uid_t>(-1)) uid_.store(uid, std::memory_order_relaxed);
+    if (gid != static_cast<gid_t>(-1)) gid_.store(gid, std::memory_order_relaxed);
+    return {};
+  }
+  [[nodiscard]] uid_t get_uid() const {
+    return uid_.load(std::memory_order_relaxed);
+  }
+  [[nodiscard]] gid_t get_gid() const {
+    return gid_.load(std::memory_order_relaxed);
   }
 
   // permissions and other mode bits
@@ -131,6 +171,10 @@ class Inode : public std::enable_shared_from_this<Inode> {
   void NotifyDescriptorClosed(Process &p);
 
  private:
+  std::atomic<int64_t> mtime_ns_{RealtimeNs()};
+  std::atomic<uid_t> uid_{0};
+  std::atomic<gid_t> gid_{0};
+  std::atomic<uint32_t> open_count_{0};
   const ino_t inum_;               // inode number
   mode_t mode_;                    // the type and mode
   bool has_advisory_lock_{false};  // An advisory lock exists for this inode
@@ -144,6 +188,13 @@ inline void InodeToStats(const Inode &ino, struct stat *buf) {
   buf->st_ino = ino.get_inum();
   buf->st_mode = ino.get_mode();
   buf->st_nlink = ino.get_nlink();
+  buf->st_uid = ino.get_uid();
+  buf->st_gid = ino.get_gid();
+  const int64_t ns = ino.get_mtime_ns();
+  buf->st_mtim.tv_sec = buf->st_ctim.tv_sec = buf->st_atim.tv_sec =
+      ns / 1000000000;
+  buf->st_mtim.tv_nsec = buf->st_ctim.tv_nsec = buf->st_atim.tv_nsec =
+      ns % 1000000000;
 }
 
 // ISoftLink is an inode type for soft links
@@ -725,10 +776,13 @@ class FSRoot {
   ~FSRoot() = default;
 
   FSRoot(const FSRoot &other)
-      : root_(other.root_), cwd_(other.get_cwd_ent()), umask_(other.umask_) {}
+      : root_(other.get_root_ent()),
+        cwd_(other.get_cwd_ent()),
+        umask_(other.umask_) {}
 
   [[nodiscard]] std::shared_ptr<IDir> get_root() const {
-    return std::static_pointer_cast<IDir>(root_->get_inode());
+    return std::static_pointer_cast<IDir>(
+        root_.load(std::memory_order_acquire)->get_inode());
   }
   [[nodiscard]] std::shared_ptr<IDir> get_cwd() const {
     return std::static_pointer_cast<IDir>(
@@ -736,7 +790,11 @@ class FSRoot {
   }
 
   [[nodiscard]] std::shared_ptr<DirectoryEntry> get_root_ent() const {
-    return root_;
+    return root_.load(std::memory_order_acquire);
+  }
+  // chroot(): path lookups already start at, and stop ".." at, this entry.
+  void SetRoot(std::shared_ptr<DirectoryEntry> new_root) {
+    root_ = std::move(new_root);
   }
   [[nodiscard]] std::shared_ptr<DirectoryEntry> get_cwd_ent() const {
     return cwd_.load(std::memory_order_acquire);
@@ -765,7 +823,7 @@ class FSRoot {
   }
 
  private:
-  std::shared_ptr<DirectoryEntry> root_;
+  std::atomic<std::shared_ptr<DirectoryEntry>> root_;
   std::atomic<std::shared_ptr<DirectoryEntry>> cwd_;
   mode_t umask_{0};
   static FSRoot *global_root_;

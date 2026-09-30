@@ -59,6 +59,8 @@ ssize_t usys_pwritev2(int fd, const iovec *iov, int iovcnt, off_t offset,
                       int flags);
 ssize_t usys_preadv(int fd, struct iovec *iov, int iovcnt, off_t offset);
 ssize_t usys_sendfile(int out_fd, int in_fd, off_t *offset, size_t count);
+ssize_t usys_splice(int fd_in, off_t *off_in, int fd_out, off_t *off_out,
+                    size_t len, unsigned int flags);
 off_t usys_lseek(int fd, off_t offset, int whence);
 long usys_fsync(int fd);
 long usys_fdatasync(int fd);
@@ -66,7 +68,8 @@ long usys_dup(int oldfd);
 long usys_dup2(int oldfd, int newfd);
 long usys_dup3(int oldfd, int newfd, int flags);
 long usys_close(int fd);
-long usys_close_range(int first, int last, unsigned int flags);
+long usys_close_range(unsigned int first, unsigned int last,
+                      unsigned int flags);
 long usys_newfstatat(int dirfd, const char *pathname, struct stat *statbuf,
                      int flags);
 long usys_statfs(const char *path, struct statfs *buf);
@@ -96,6 +99,11 @@ ssize_t usys_readlinkat(int dirfd, const char *pathname, char *buf,
                         size_t bufsiz);
 
 long usys_chmod(const char *path, mode_t mode);
+long usys_chown(const char *path, uid_t owner, gid_t group);
+long usys_lchown(const char *path, uid_t owner, gid_t group);
+long usys_fchown(int fd, uid_t owner, gid_t group);
+long usys_fchownat(int dirfd, const char *path, uid_t owner, gid_t group,
+                   int flags);
 long usys_fchmod(int fd, mode_t mode);
 long usys_fchmodat(int dirfd, const char *path, mode_t mode, int flags);
 long usys_fchmodat2(int dirfd, const char *path, mode_t mode, int flags);
@@ -109,6 +117,8 @@ intptr_t usys_mmap(void *addr, size_t len, int prot, int flags, int fd,
                    off_t offset);
 long usys_mprotect(void *addr, size_t len, int prot);
 long usys_munmap(void *addr, size_t len);
+long usys_mremap(void *old_addr, size_t old_len, size_t new_len, int flags,
+                 void *new_addr);
 long usys_madvise(void *addr, size_t len, int hint);
 
 // Net
@@ -163,6 +173,16 @@ long usys_getpid();
 long usys_getppid();
 long usys_gettid();
 long usys_getpgrp();
+long usys_chroot(const char *pathname);
+long usys_setreuid(uid_t ruid, uid_t euid);
+long usys_setregid(gid_t rgid, gid_t egid);
+long usys_timer_create(clockid_t clockid, struct sigevent *sevp, int *timerid);
+long usys_timer_settime(int timerid, int flags, const struct itimerspec *nv,
+                        struct itimerspec *ov);
+long usys_timer_gettime(int timerid, struct itimerspec *cur);
+long usys_timer_getoverrun(int timerid);
+long usys_timer_delete(int timerid);
+long usys_ptrace(long request, long pid, void *addr, void *data);
 long usys_getpgid(pid_t pid);
 long usys_setpgid(pid_t pid, pid_t pgid);
 long usys_set_tid_address(int *tidptr);
@@ -222,7 +242,7 @@ long usys_getrlimit(int resource, struct rlimit *rlim);
 long usys_setrlimit(int resource, const struct rlimit *rlim);
 long usys_prlimit64(pid_t pid, int resource, const struct rlimit *new_limit,
                     struct rlimit *old_limit);
-long usys_ioctl(int fd, unsigned int request, char *argp);
+long usys_ioctl(int fd, unsigned int request, void *arg);
 long usys_sysinfo(struct sysinfo *info);
 long usys_getuid();
 long usys_geteuid();

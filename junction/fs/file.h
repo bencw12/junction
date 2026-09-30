@@ -3,6 +3,9 @@
 #pragma once
 
 extern "C" {
+extern "C" {
+#include <poll.h>
+}
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/statfs.h>
@@ -260,6 +263,9 @@ class File : public std::enable_shared_from_this<File> {
   }
 
  private:
+  // Files that can block say when they are ready by overriding this and
+  // driving the poll source themselves (pipes do it from their constructors,
+  // so the default has to leave the source alone).
   virtual void SetupPollSource() {}
 
   const FileType type_;
@@ -276,6 +282,21 @@ class File : public std::enable_shared_from_this<File> {
 class SeekableFile : public File {
  public:
   using File::File;
+
+ private:
+  // A file with a position -- a regular file on either filesystem, /dev/null
+  // and its kind -- never blocks, so poll() and select() report it readable
+  // and writable at once, always. It used to be never. apt selects on the file
+  // it is downloading into, to flush its buffer; for a package small enough to
+  // arrive in one segment nothing else would wake it, and it sat there until
+  // the server gave up on the idle connection two seconds later. The EOF that
+  // woke it came before the flush, and a complete 1 KB package was reported as
+  // "Error reading from server. Remote end closed connection".
+  void SetupPollSource() override {
+    get_poll_source().Set(POLLIN | POLLOUT);
+  }
+
+ public:
   Status<off_t> Seek(off_t off, SeekFrom origin) final override {
     switch (origin) {
       case SeekFrom::kStart:

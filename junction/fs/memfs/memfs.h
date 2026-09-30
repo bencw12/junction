@@ -8,6 +8,7 @@
 #include "junction/fs/dev.h"
 #include "junction/fs/file.h"
 #include "junction/fs/fs.h"
+#include "junction/fs/fsstat.h"
 #include "junction/snapshot/snapshot.h"
 
 namespace junction::memfs {
@@ -68,6 +69,7 @@ class MemInode : public Inode {
            ino_t inum = AllocateInodeNumber())
       : Inode(kTypeRegularFile | mode, inum), buf_(buf), extent_offset_(off) {}
   ~MemInode() override;
+  [[nodiscard]] int fs_kind() const override { return 0; /* kFsMemfs */ }
 
   // Create a new MemInode.
   static Status<std::shared_ptr<MemInode>> Create(mode_t mode);
@@ -100,10 +102,15 @@ class MemInode : public Inode {
     // Truncate buf if it will overflow our max size.
     if (unlikely(buf.size() > kMaxSizeBytes - off))
       buf = buf.subspan(0, kMaxSizeBytes - off);
+    TouchMtime();
     rt::ScopedSharedLock g_(lock_);
     if (off + buf.size() > size_) {
       lock_.UpgradeLock();
-      if (off + buf.size() > size_) size_ = off + buf.size();
+      if (off + buf.size() > size_) {
+        FsStatMemfsBytes(static_cast<int64_t>(off + buf.size()) -
+                         static_cast<int64_t>(size_));
+        size_ = off + buf.size();
+      }
       lock_.DowngradeLock();
     }
     if (unlikely(NeedsTrace())) {
@@ -287,6 +294,9 @@ class MemISoftLink : public ISoftLink {
   std::string ReadLink() const override { return path_; }
   Status<void> GetStats(struct stat *buf) const override {
     MemInodeToStats(*this, buf);
+    // A symlink's size is the length of its target. dpkg lstat()s a link,
+    // readlink()s it, and refuses the package if the two disagree.
+    buf->st_size = path_.size();
     return {};
   }
 

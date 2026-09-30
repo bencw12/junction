@@ -1,3 +1,4 @@
+#include <malloc.h>
 #include "junction/run.h"
 
 #include <iostream>
@@ -256,6 +257,17 @@ void usage() {
 }
 
 int main(int argc, char *argv[]) {
+  // One malloc arena, decided before any thread exists. glibc gives a thread
+  // that finds the main arena busy a heap of its own: 64 MB reserved
+  // PROT_NONE, made writable piecemeal with mprotect() as it fills. The
+  // kthreads get theirs before the LibOS arena is up, so those heaps are
+  // native mappings, and each later mprotect() lands in whichever address
+  // space that core is bound to and no other -- where the same page is still
+  // PROT_NONE (SEGV_ACCERR in malloc, in a forked guest) or, worse, a private
+  // copy. The main arena never grows that way: brk is refused once the filter
+  // is in, and what it mmaps instead comes from the LibOS arena.
+  mallopt(M_ARENA_MAX, 1);
+
   if (argc < 2) {
     usage();
     return -EINVAL;

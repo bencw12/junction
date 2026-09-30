@@ -18,6 +18,7 @@ extern "C" {
 }
 
 #include "junction/kernel/arena.h"
+#include "junction/fs/fsstat.h"
 #include "junction/kernel/as.h"
 #include "junction/kernel/memtrace.h"
 #include "kern/junction_as.h"
@@ -331,6 +332,7 @@ Status<void> init() {
     return ret;
   }
   StartArenaGc();
+  StartFsStatReporter();
 
   // Hang watchdog. Runs as an ordinary runtime thread, which keeps being
   // scheduled even when every guest thread is blocked -- that is exactly the

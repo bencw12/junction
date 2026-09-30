@@ -3,6 +3,7 @@
 #pragma once
 
 #include <memory>
+#include <vector>
 #include <optional>
 
 #include "junction/base/error.h"
@@ -216,6 +217,16 @@ class Socket : public File {
   }
 
   bool reuse_port_{false};
+
+  // Advisory options that were set, so they read back (see SetSockOpt).
+
+  struct AdvisoryOpt {
+
+    int level, optname, value;
+
+  };
+
+  std::vector<AdvisoryOpt> advisory_opts_;
   Duration read_timeout_{0};
   Duration write_timeout_{0};
   size_t socket_options_{0};
